@@ -68,11 +68,21 @@ func WrapperErrorWithMessage(
 		})
 	case mode.VideoGenerationsJobs,
 		mode.VideoGenerationsGetJobs,
-		mode.VideoGenerationsContent:
+		mode.VideoGenerationsContent,
+		mode.Videos,
+		mode.VideosGet,
+		mode.VideosContent,
+		mode.VideosDelete,
+		mode.VideosRemix,
+		mode.VideosEdits,
+		mode.VideosExtensions:
 		return NewOpenAIVideoError(statusCode, OpenAIVideoError{
 			Detail: message,
 		})
-	case mode.Gemini:
+	case mode.Gemini,
+		mode.GeminiFiles,
+		mode.GeminiVideo,
+		mode.GeminiVideoOperations:
 		return NewGeminiError(statusCode, GeminiError{
 			Message: message,
 			Status:  opt.Type,

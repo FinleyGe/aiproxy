@@ -5,54 +5,53 @@ import "fmt"
 type Mode int
 
 func (m Mode) String() string {
-	switch m {
-	case Unknown:
-		return "Unknown"
-	case ChatCompletions:
-		return "ChatCompletions"
-	case Completions:
-		return "Completions"
-	case Embeddings:
-		return "Embeddings"
-	case Moderations:
-		return "Moderations"
-	case ImagesGenerations:
-		return "ImagesGenerations"
-	case ImagesEdits:
-		return "ImagesEdits"
-	case AudioSpeech:
-		return "AudioSpeech"
-	case AudioTranscription:
-		return "AudioTranscription"
-	case AudioTranslation:
-		return "AudioTranslation"
-	case Rerank:
-		return "Rerank"
-	case ParsePdf:
-		return "ParsePdf"
-	case Anthropic:
-		return "Anthropic"
-	case VideoGenerationsJobs:
-		return "VideoGenerationsJobs"
-	case VideoGenerationsGetJobs:
-		return "VideoGenerationsGetJobs"
-	case VideoGenerationsContent:
-		return "VideoGenerationsContent"
-	case Responses:
-		return "Responses"
-	case ResponsesGet:
-		return "ResponsesGet"
-	case ResponsesDelete:
-		return "ResponsesDelete"
-	case ResponsesCancel:
-		return "ResponsesCancel"
-	case ResponsesInputItems:
-		return "ResponsesInputItems"
-	case Gemini:
-		return "Gemini"
-	default:
-		return fmt.Sprintf("Mode(%d)", m)
+	if name, ok := modeNames[m]; ok {
+		return name
 	}
+
+	return fmt.Sprintf("Mode(%d)", m)
+}
+
+var modeNames = map[Mode]string{
+	Unknown:                 "Unknown",
+	ChatCompletions:         "ChatCompletions",
+	Completions:             "Completions",
+	Embeddings:              "Embeddings",
+	Moderations:             "Moderations",
+	ImagesGenerations:       "ImagesGenerations",
+	ImagesEdits:             "ImagesEdits",
+	AudioSpeech:             "AudioSpeech",
+	AudioTranscription:      "AudioTranscription",
+	AudioTranslation:        "AudioTranslation",
+	Rerank:                  "Rerank",
+	ParsePdf:                "ParsePdf",
+	Anthropic:               "Anthropic",
+	VideoGenerationsJobs:    "VideoGenerationsJobs",
+	VideoGenerationsGetJobs: "VideoGenerationsGetJobs",
+	VideoGenerationsContent: "VideoGenerationsContent",
+	Videos:                  "Videos",
+	VideosGet:               "VideosGet",
+	VideosContent:           "VideosContent",
+	VideosDelete:            "VideosDelete",
+	VideosRemix:             "VideosRemix",
+	VideosEdits:             "VideosEdits",
+	VideosExtensions:        "VideosExtensions",
+	GeminiVideo:             "GeminiVideo",
+	GeminiVideoOperations:   "GeminiVideoOperations",
+	AliVideo:                "AliVideo",
+	AliVideoTasks:           "AliVideoTasks",
+	DoubaoVideo:             "DoubaoVideo",
+	DoubaoVideoTasks:        "DoubaoVideoTasks",
+	DoubaoVideoTasksDelete:  "DoubaoVideoTasksDelete",
+	GeminiTTS:               "GeminiTTS",
+	GeminiImage:             "GeminiImage",
+	GeminiFiles:             "GeminiFiles",
+	Responses:               "Responses",
+	ResponsesGet:            "ResponsesGet",
+	ResponsesDelete:         "ResponsesDelete",
+	ResponsesCancel:         "ResponsesCancel",
+	ResponsesInputItems:     "ResponsesInputItems",
+	Gemini:                  "Gemini",
 }
 
 const (
@@ -78,4 +77,21 @@ const (
 	ResponsesCancel
 	ResponsesInputItems
 	Gemini
+	Videos
+	VideosGet
+	VideosContent
+	VideosDelete
+	VideosRemix
+	GeminiVideo
+	GeminiVideoOperations
+	GeminiTTS
+	GeminiImage
+	GeminiFiles
+	VideosEdits
+	VideosExtensions
+	AliVideo
+	AliVideoTasks
+	DoubaoVideo
+	DoubaoVideoTasks
+	DoubaoVideoTasksDelete
 )

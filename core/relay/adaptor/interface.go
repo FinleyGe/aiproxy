@@ -1,6 +1,7 @@
 package adaptor
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -10,7 +11,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/labring/aiproxy/core/model"
 	"github.com/labring/aiproxy/core/relay/meta"
-	"github.com/labring/aiproxy/core/relay/mode"
 )
 
 type StoreCache struct {
@@ -19,19 +19,28 @@ type StoreCache struct {
 	TokenID   int
 	ChannelID int
 	Model     string
+	Metadata  string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 	ExpiresAt time.Time
+}
+
+type SaveStoreOption struct {
+	MinUpdateInterval time.Duration
 }
 
 type Store interface {
 	GetStore(group string, tokenID int, id string) (StoreCache, error)
 	SaveStore(store StoreCache) error
+	SaveStoreWithOption(store StoreCache, opt SaveStoreOption) error
+	SaveIfNotExistStore(store StoreCache) error
 }
 
 type Metadata struct {
-	ConfigTemplates ConfigTemplates
-	KeyHelp         string
-	Readme          string
-	Models          []model.ModelConfig
+	ConfigSchema map[string]any
+	KeyHelp      string
+	Readme       string
+	Models       []model.ModelConfig
 }
 
 type RequestURL struct {
@@ -60,18 +69,39 @@ type DoRequest interface {
 	) (*http.Response, error)
 }
 
+// DoResponseResult contains the result of DoResponse
+type DoResponseResult struct {
+	Usage        model.Usage
+	UsageContext model.UsageContext
+	UpstreamID   string // ID from response body or x-request-id header
+	AsyncUsage   bool   // usage will be fetched asynchronously by upstream ID
+}
+
 type DoResponse interface {
 	DoResponse(
 		meta *meta.Meta,
 		store Store,
 		c *gin.Context,
 		resp *http.Response,
-	) (model.Usage, Error)
+	) (DoResponseResult, Error)
+}
+
+type AsyncUsageRequest struct {
+	Channel *model.Channel
+	Info    *model.AsyncUsageInfo
+	Store   Store
+}
+
+type AsyncUsageFetcher interface {
+	FetchAsyncUsage(
+		ctx context.Context,
+		request AsyncUsageRequest,
+	) (usage model.Usage, usageContext model.UsageContext, completed bool, err error)
 }
 
 type Adaptor interface {
 	Metadata() Metadata
-	SupportMode(mode mode.Mode) bool
+	SupportMode(meta *meta.Meta) bool
 	DefaultBaseURL() string
 	GetRequestURL
 	SetupRequestHeader
@@ -101,14 +131,4 @@ type KeyValidator interface {
 	ValidateKey(key string) error
 }
 
-type ConfigTemplate struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Example     string `json:"example,omitempty"`
-	Required    bool   `json:"required"`
-}
-
-type ConfigTemplates struct {
-	Configs   map[string]ConfigTemplate
-	Validator func(model.ChannelConfigs) error `json:"-"`
-}
+type ConfigValidator func(model.ChannelConfigs) error

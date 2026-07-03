@@ -2,9 +2,12 @@ package openai_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -148,7 +151,7 @@ func TestConvertChatCompletionWithToolsRequiredField(t *testing.T) {
 			reqBody, err := json.Marshal(tt.inputRequest)
 			require.NoError(t, err)
 
-			req := httptest.NewRequest(
+			req, _ := http.NewRequestWithContext(context.Background(),
 				http.MethodPost,
 				"/v1/chat/completions",
 				bytes.NewReader(reqBody),
@@ -214,6 +217,20 @@ func TestIsResponsesOnlyModel(t *testing.T) {
 	}
 }
 
+func TestIsResponsesOnlyModelAny(t *testing.T) {
+	t.Run("prefers origin model match", func(t *testing.T) {
+		assert.True(t, openai.IsResponsesOnlyModelAny(nil, "gpt-5-codex", "mapped-model"))
+	})
+
+	t.Run("falls back to actual model match", func(t *testing.T) {
+		assert.True(t, openai.IsResponsesOnlyModelAny(nil, "custom-model", "gpt-5-codex"))
+	})
+
+	t.Run("returns false when neither matches", func(t *testing.T) {
+		assert.False(t, openai.IsResponsesOnlyModelAny(nil, "custom-model", "mapped-model"))
+	})
+}
+
 func TestConvertChatCompletionToResponsesRequest(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -233,6 +250,60 @@ func TestConvertChatCompletionToResponsesRequest(t *testing.T) {
 				assert.Equal(t, "gpt-5-codex", responsesReq.Model)
 				assert.NotNil(t, responsesReq.Store)
 				assert.False(t, *responsesReq.Store)
+				assert.Nil(t, responsesReq.Reasoning)
+			},
+		},
+		{
+			name: "reasoning effort maps effort without enabling summary",
+			inputRequest: relaymodel.GeneralOpenAIRequest{
+				Model: "gpt-5-codex",
+				Messages: []relaymodel.Message{
+					{Role: "user", Content: "Hello"},
+				},
+				ReasoningEffort: new("medium"),
+			},
+			checkFunc: func(t *testing.T, responsesReq relaymodel.CreateResponseRequest) {
+				t.Helper()
+				require.NotNil(t, responsesReq.Reasoning)
+				require.NotNil(t, responsesReq.Reasoning.Effort)
+				assert.Equal(t, "medium", *responsesReq.Reasoning.Effort)
+				assert.Nil(t, responsesReq.Reasoning.Summary)
+			},
+		},
+		{
+			name: "none reasoning effort does not enable reasoning summary",
+			inputRequest: relaymodel.GeneralOpenAIRequest{
+				Model: "gpt-5-codex",
+				Messages: []relaymodel.Message{
+					{Role: "user", Content: "Hello"},
+				},
+				ReasoningEffort: new("none"),
+			},
+			checkFunc: func(t *testing.T, responsesReq relaymodel.CreateResponseRequest) {
+				t.Helper()
+				require.NotNil(t, responsesReq.Reasoning)
+				assert.Nil(t, responsesReq.Reasoning.Summary)
+			},
+		},
+		{
+			name: "system messages become developer messages",
+			inputRequest: relaymodel.GeneralOpenAIRequest{
+				Model: "gpt-5.5",
+				Messages: []relaymodel.Message{
+					{Role: "system", Content: "You are concise."},
+					{Role: "user", Content: "Hello"},
+				},
+			},
+			checkFunc: func(t *testing.T, responsesReq relaymodel.CreateResponseRequest) {
+				t.Helper()
+
+				inputItems, ok := responsesReq.Input.([]any)
+				require.True(t, ok)
+				require.Len(t, inputItems, 2)
+
+				systemItem, ok := inputItems[0].(map[string]any)
+				require.True(t, ok)
+				assert.Equal(t, "developer", systemItem["role"])
 			},
 		},
 		{
@@ -242,7 +313,7 @@ func TestConvertChatCompletionToResponsesRequest(t *testing.T) {
 				Messages: []relaymodel.Message{
 					{Role: "user", Content: "Hello"},
 				},
-				Temperature: floatPtr(0.7),
+				Temperature: new(0.7),
 				MaxTokens:   100,
 			},
 			checkFunc: func(t *testing.T, responsesReq relaymodel.CreateResponseRequest) {
@@ -301,6 +372,232 @@ func TestConvertChatCompletionToResponsesRequest(t *testing.T) {
 				assert.Equal(t, "auto", responsesReq.ToolChoice)
 			},
 		},
+		{
+			name: "request with named tool choice",
+			inputRequest: relaymodel.GeneralOpenAIRequest{
+				Model: "gpt-5-codex",
+				Messages: []relaymodel.Message{
+					{Role: "user", Content: "What's the weather?"},
+				},
+				Tools: []relaymodel.Tool{
+					{
+						Type: "function",
+						Function: relaymodel.Function{
+							Name: "get_weather",
+						},
+					},
+				},
+				ToolChoice: map[string]any{
+					"type":     "function",
+					"function": map[string]any{"name": "get_weather"},
+				},
+			},
+			checkFunc: func(t *testing.T, responsesReq relaymodel.CreateResponseRequest) {
+				t.Helper()
+				assert.Equal(
+					t,
+					map[string]any{"type": "function", "name": "get_weather"},
+					responsesReq.ToolChoice,
+				)
+			},
+		},
+		{
+			name: "request with legacy functions",
+			inputRequest: relaymodel.GeneralOpenAIRequest{
+				Model: "gpt-5-codex",
+				Messages: []relaymodel.Message{
+					{Role: "user", Content: "What's the weather?"},
+				},
+				Functions: []any{
+					map[string]any{
+						"name":        "get_weather",
+						"description": "Get weather information",
+						"parameters": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"location": map[string]any{
+									"type": "string",
+								},
+							},
+						},
+					},
+				},
+				FunctionCall: map[string]any{"name": "get_weather"},
+			},
+			checkFunc: func(t *testing.T, responsesReq relaymodel.CreateResponseRequest) {
+				t.Helper()
+				require.Len(t, responsesReq.Tools, 1)
+				assert.Equal(t, "function", responsesReq.Tools[0].Type)
+				assert.Equal(t, "get_weather", responsesReq.Tools[0].Name)
+				assert.Equal(
+					t,
+					map[string]any{"type": "function", "name": "get_weather"},
+					responsesReq.ToolChoice,
+				)
+			},
+		},
+		{
+			name: "request with image content",
+			inputRequest: relaymodel.GeneralOpenAIRequest{
+				Model: "gpt-5.5",
+				Messages: []relaymodel.Message{
+					{
+						Role: "user",
+						Content: []any{
+							map[string]any{
+								"type": "text",
+								"text": "What's in this image?",
+							},
+							map[string]any{
+								"type": "image_url",
+								"image_url": map[string]any{
+									"url":    "https://example.com/image.png",
+									"detail": "high",
+								},
+							},
+						},
+					},
+				},
+			},
+			checkFunc: func(t *testing.T, responsesReq relaymodel.CreateResponseRequest) {
+				t.Helper()
+
+				inputItems, ok := responsesReq.Input.([]any)
+				require.True(t, ok)
+				require.Len(t, inputItems, 1)
+
+				userItem, ok := inputItems[0].(map[string]any)
+				require.True(t, ok)
+				content, ok := userItem["content"].([]any)
+				require.True(t, ok)
+				require.Len(t, content, 2)
+
+				imageContent, ok := content[1].(map[string]any)
+				require.True(t, ok)
+				assert.Equal(t, "input_image", imageContent["type"])
+				assert.Equal(t, "https://example.com/image.png", imageContent["image_url"])
+				assert.Equal(t, "high", imageContent["detail"])
+			},
+		},
+		{
+			name: "request with response format",
+			inputRequest: relaymodel.GeneralOpenAIRequest{
+				Model: "gpt-5-codex",
+				Messages: []relaymodel.Message{
+					{Role: "user", Content: "Return JSON"},
+				},
+				ResponseFormat: &relaymodel.ResponseFormat{
+					Type: "json_schema",
+					JSONSchema: &relaymodel.JSONSchema{
+						Name: "answer",
+						Schema: map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"answer": map[string]any{"type": "string"},
+							},
+						},
+					},
+				},
+			},
+			checkFunc: func(t *testing.T, responsesReq relaymodel.CreateResponseRequest) {
+				t.Helper()
+				require.NotNil(t, responsesReq.Text)
+				assert.Equal(t, "json_schema", responsesReq.Text.Format.Type)
+				assert.Equal(t, "answer", responsesReq.Text.Format.Name)
+				assert.Equal(t, map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"answer": map[string]any{"type": "string"},
+					},
+				}, responsesReq.Text.Format.Schema)
+			},
+		},
+		{
+			name: "request with logprobs",
+			inputRequest: relaymodel.GeneralOpenAIRequest{
+				Model: "gpt-5-codex",
+				Messages: []relaymodel.Message{
+					{Role: "user", Content: "Hello"},
+				},
+				Logprobs: func() *bool {
+					value := true
+					return &value
+				}(),
+				TopLogprobs: func() *int {
+					value := 3
+					return &value
+				}(),
+			},
+			checkFunc: func(t *testing.T, responsesReq relaymodel.CreateResponseRequest) {
+				t.Helper()
+				require.NotNil(t, responsesReq.TopLogprobs)
+				assert.Equal(t, 3, *responsesReq.TopLogprobs)
+				assert.Contains(t, responsesReq.Include, "message.output_text.logprobs")
+			},
+		},
+		{
+			name: "request with parallel tool calls",
+			inputRequest: relaymodel.GeneralOpenAIRequest{
+				Model: "gpt-5-codex",
+				Messages: []relaymodel.Message{
+					{Role: "user", Content: "Hello"},
+				},
+				ParallelToolCalls: new(bool),
+			},
+			checkFunc: func(t *testing.T, responsesReq relaymodel.CreateResponseRequest) {
+				t.Helper()
+				require.NotNil(t, responsesReq.ParallelToolCalls)
+				assert.False(t, *responsesReq.ParallelToolCalls)
+			},
+		},
+		{
+			name: "request with service tier",
+			inputRequest: relaymodel.GeneralOpenAIRequest{
+				Model:       "gpt-5-codex",
+				ServiceTier: "priority",
+				Messages: []relaymodel.Message{
+					{Role: "user", Content: "Hello"},
+				},
+			},
+			checkFunc: func(t *testing.T, responsesReq relaymodel.CreateResponseRequest) {
+				t.Helper()
+				require.NotNil(t, responsesReq.ServiceTier)
+				assert.Equal(t, "priority", *responsesReq.ServiceTier)
+			},
+		},
+		{
+			name: "request with prompt cache key",
+			inputRequest: relaymodel.GeneralOpenAIRequest{
+				Model:          "gpt-5-codex",
+				PromptCacheKey: "cache-key-1",
+				Messages: []relaymodel.Message{
+					{Role: "user", Content: "Hello"},
+				},
+			},
+			checkFunc: func(t *testing.T, responsesReq relaymodel.CreateResponseRequest) {
+				t.Helper()
+				require.NotNil(t, responsesReq.PromptCacheKey)
+				assert.Equal(t, "cache-key-1", *responsesReq.PromptCacheKey)
+			},
+		},
+		{
+			name: "request with prompt cache retention and user",
+			inputRequest: relaymodel.GeneralOpenAIRequest{
+				Model:                "gpt-5-codex",
+				PromptCacheRetention: "24h",
+				User:                 "user-123",
+				Messages: []relaymodel.Message{
+					{Role: "user", Content: "Hello"},
+				},
+			},
+			checkFunc: func(t *testing.T, responsesReq relaymodel.CreateResponseRequest) {
+				t.Helper()
+				require.NotNil(t, responsesReq.PromptCacheRetention)
+				assert.Equal(t, "24h", *responsesReq.PromptCacheRetention)
+				require.NotNil(t, responsesReq.User)
+				assert.Equal(t, "user-123", *responsesReq.User)
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -308,7 +605,7 @@ func TestConvertChatCompletionToResponsesRequest(t *testing.T) {
 			reqBody, err := json.Marshal(tt.inputRequest)
 			require.NoError(t, err)
 
-			req := httptest.NewRequest(
+			req, _ := http.NewRequestWithContext(context.Background(),
 				http.MethodPost,
 				"/v1/chat/completions",
 				bytes.NewReader(reqBody),
@@ -330,6 +627,105 @@ func TestConvertChatCompletionToResponsesRequest(t *testing.T) {
 			tt.checkFunc(t, responsesReq)
 		})
 	}
+}
+
+func TestConvertChatCompletionToResponsesRequestAcceptsMultipleChoices(t *testing.T) {
+	inputRequest := relaymodel.GeneralOpenAIRequest{
+		Model: "gpt-5-codex",
+		Messages: []relaymodel.Message{
+			{Role: "user", Content: "Hello"},
+		},
+		N: 2,
+	}
+	reqBody, err := json.Marshal(inputRequest)
+	require.NoError(t, err)
+
+	req, _ := http.NewRequestWithContext(context.Background(),
+		http.MethodPost,
+		"/v1/chat/completions",
+		bytes.NewReader(reqBody),
+	)
+	req.Header.Set("Content-Type", "application/json")
+
+	m := &meta.Meta{
+		ActualModel: inputRequest.Model,
+	}
+
+	result, err := openai.ConvertChatCompletionToResponsesRequest(m, req)
+	require.NoError(t, err)
+
+	body, err := io.ReadAll(result.Body)
+	require.NoError(t, err)
+
+	assert.NotContains(t, string(body), `"n"`)
+
+	var responsesReq relaymodel.CreateResponseRequest
+
+	err = json.Unmarshal(body, &responsesReq)
+	require.NoError(t, err)
+
+	assert.Equal(t, inputRequest.Model, responsesReq.Model)
+	assert.Equal(t, false, *responsesReq.Store)
+}
+
+func TestConvertChatCompletionToResponsesRequestFlattensJSONSchemaTextFormat(t *testing.T) {
+	strict := true
+	inputRequest := relaymodel.GeneralOpenAIRequest{
+		Model: "gpt-5-codex",
+		Messages: []relaymodel.Message{
+			{Role: "user", Content: "Return JSON"},
+		},
+		ResponseFormat: &relaymodel.ResponseFormat{
+			Type: "json_schema",
+			JSONSchema: &relaymodel.JSONSchema{
+				Name:        "answer",
+				Description: "Answer payload",
+				Strict:      &strict,
+				Schema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"answer": map[string]any{"type": "string"},
+					},
+					"required": []any{"answer"},
+				},
+			},
+		},
+	}
+	reqBody, err := json.Marshal(inputRequest)
+	require.NoError(t, err)
+
+	req, _ := http.NewRequestWithContext(context.Background(),
+		http.MethodPost,
+		"/v1/chat/completions",
+		bytes.NewReader(reqBody),
+	)
+	req.Header.Set("Content-Type", "application/json")
+
+	result, err := openai.ConvertChatCompletionToResponsesRequest(&meta.Meta{
+		ActualModel: inputRequest.Model,
+	}, req)
+	require.NoError(t, err)
+
+	body, err := io.ReadAll(result.Body)
+	require.NoError(t, err)
+
+	assert.NotContains(t, string(body), `"json_schema":`)
+
+	var raw map[string]any
+
+	err = json.Unmarshal(body, &raw)
+	require.NoError(t, err)
+
+	text, ok := raw["text"].(map[string]any)
+	require.True(t, ok)
+	format, ok := text["format"].(map[string]any)
+	require.True(t, ok)
+
+	assert.Equal(t, "json_schema", format["type"])
+	assert.Equal(t, "answer", format["name"])
+	assert.Equal(t, "Answer payload", format["description"])
+	assert.Equal(t, true, format["strict"])
+	assert.NotNil(t, format["schema"])
 }
 
 func TestConvertResponsesToChatCompletionResponse(t *testing.T) {
@@ -359,11 +755,11 @@ func TestConvertResponsesToChatCompletionResponse(t *testing.T) {
 					OutputTokens: 5,
 					TotalTokens:  15,
 				},
+				ServiceTier: new("priority"),
 			},
 			checkFunc: func(t *testing.T, chatResp relaymodel.TextResponse) {
 				t.Helper()
 				assert.Equal(t, "resp_123", chatResp.ID)
-				assert.Equal(t, "gpt-5-codex", chatResp.Model)
 				assert.Equal(t, "chat.completion", chatResp.Object)
 				require.Len(t, chatResp.Choices, 1)
 				assert.Contains(t, chatResp.Choices[0].Message.Content, "Hello, world!")
@@ -382,9 +778,9 @@ func TestConvertResponsesToChatCompletionResponse(t *testing.T) {
 				CreatedAt: 1234567890,
 				Output: []relaymodel.OutputItem{
 					{
-						Type: "reasoning",
-						Content: []relaymodel.OutputContent{
-							{Type: "text", Text: "Let me think about this..."},
+						Type: relaymodel.InputItemTypeReasoning,
+						Summary: []relaymodel.SummaryPart{
+							{Type: "summary_text", Text: "Need answer the math question."},
 						},
 					},
 					{
@@ -403,16 +799,256 @@ func TestConvertResponsesToChatCompletionResponse(t *testing.T) {
 			},
 			checkFunc: func(t *testing.T, chatResp relaymodel.TextResponse) {
 				t.Helper()
-				// Current implementation creates one choice per output item
-				require.Len(t, chatResp.Choices, 2)
-				// First choice is reasoning
-				assert.Contains(
+				require.Len(t, chatResp.Choices, 1)
+				assert.Contains(t, chatResp.Choices[0].Message.Content, "The answer is 42.")
+				assert.Equal(
 					t,
-					chatResp.Choices[0].Message.Content,
-					"Let me think about this...",
+					"Need answer the math question.",
+					chatResp.Choices[0].Message.ReasoningContent,
 				)
-				// Second choice is the message
-				assert.Contains(t, chatResp.Choices[1].Message.Content, "The answer is 42.")
+			},
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name: "message response without role defaults to assistant",
+			responsesResp: relaymodel.Response{
+				ID:        "resp_missing_role",
+				Model:     "gpt-5-mini",
+				Status:    relaymodel.ResponseStatusCompleted,
+				CreatedAt: 1781355958,
+				Output: []relaymodel.OutputItem{
+					{
+						Type: relaymodel.InputItemTypeMessage,
+						Content: []relaymodel.OutputContent{
+							{Type: "output_text", Text: "Hello"},
+						},
+					},
+				},
+				Usage: &relaymodel.ResponseUsage{
+					InputTokens:  4,
+					OutputTokens: 2,
+					TotalTokens:  6,
+				},
+			},
+			checkFunc: func(t *testing.T, chatResp relaymodel.TextResponse) {
+				t.Helper()
+				require.Len(t, chatResp.Choices, 1)
+				assert.Equal(t, relaymodel.RoleAssistant, chatResp.Choices[0].Message.Role)
+				assert.Equal(t, "Hello", chatResp.Choices[0].Message.Content)
+			},
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name: "reasoning summary attaches only to first converted choice",
+			responsesResp: relaymodel.Response{
+				ID:        "resp_multi_reasoning",
+				Model:     "gpt-5-mini",
+				Status:    relaymodel.ResponseStatusCompleted,
+				CreatedAt: 1781355958,
+				Output: []relaymodel.OutputItem{
+					{
+						Type: relaymodel.InputItemTypeReasoning,
+						Summary: []relaymodel.SummaryPart{
+							{Type: "summary_text", Text: "Need compare options."},
+						},
+					},
+					{
+						Type: relaymodel.InputItemTypeMessage,
+						Role: relaymodel.RoleAssistant,
+						Content: []relaymodel.OutputContent{
+							{Type: "output_text", Text: "Option A"},
+						},
+					},
+					{
+						Type: relaymodel.InputItemTypeMessage,
+						Role: relaymodel.RoleAssistant,
+						Content: []relaymodel.OutputContent{
+							{Type: "output_text", Text: "Option B"},
+						},
+					},
+				},
+				Usage: &relaymodel.ResponseUsage{
+					InputTokens:  8,
+					OutputTokens: 4,
+					TotalTokens:  12,
+				},
+			},
+			checkFunc: func(t *testing.T, chatResp relaymodel.TextResponse) {
+				t.Helper()
+				require.Len(t, chatResp.Choices, 2)
+				assert.Equal(
+					t,
+					"Need compare options.",
+					chatResp.Choices[0].Message.ReasoningContent,
+				)
+				assert.Empty(t, chatResp.Choices[1].Message.ReasoningContent)
+			},
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name: "incomplete reasoning-only response",
+			responsesResp: relaymodel.Response{
+				ID:        "resp_incomplete",
+				Model:     "gpt-5-mini",
+				Status:    relaymodel.ResponseStatusIncomplete,
+				CreatedAt: 1781355958,
+				Output: []relaymodel.OutputItem{
+					{
+						Type:    relaymodel.InputItemTypeReasoning,
+						Summary: []relaymodel.SummaryPart{},
+					},
+				},
+				IncompleteDetails: &relaymodel.IncompleteDetails{
+					Reason: "max_output_tokens",
+				},
+				Usage: &relaymodel.ResponseUsage{
+					InputTokens:  268,
+					OutputTokens: 192,
+					OutputTokensDetails: &relaymodel.ResponseUsageDetails{
+						ReasoningTokens: 192,
+					},
+					TotalTokens: 460,
+				},
+			},
+			checkFunc: func(t *testing.T, chatResp relaymodel.TextResponse) {
+				t.Helper()
+				require.Len(t, chatResp.Choices, 1)
+				choice := chatResp.Choices[0]
+				assert.Equal(t, 0, choice.Index)
+				assert.Equal(t, relaymodel.RoleAssistant, choice.Message.Role)
+				assert.Equal(t, "", choice.Message.Content)
+				assert.Equal(t, relaymodel.FinishReasonLength, choice.FinishReason)
+				assert.Equal(t, int64(192), chatResp.Usage.CompletionTokens)
+				require.NotNil(t, chatResp.Usage.CompletionTokensDetails)
+				assert.Equal(
+					t,
+					int64(192),
+					chatResp.Usage.CompletionTokensDetails.ReasoningTokens,
+				)
+			},
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name: "incomplete content filter response",
+			responsesResp: relaymodel.Response{
+				ID:        "resp_content_filter",
+				Model:     "gpt-5-mini",
+				Status:    relaymodel.ResponseStatusIncomplete,
+				CreatedAt: 1781355958,
+				IncompleteDetails: &relaymodel.IncompleteDetails{
+					Reason: "content_filter",
+				},
+				Usage: &relaymodel.ResponseUsage{
+					InputTokens:  12,
+					OutputTokens: 3,
+					TotalTokens:  15,
+				},
+			},
+			checkFunc: func(t *testing.T, chatResp relaymodel.TextResponse) {
+				t.Helper()
+				require.Len(t, chatResp.Choices, 1)
+				assert.Equal(
+					t,
+					relaymodel.FinishReasonContentFilter,
+					chatResp.Choices[0].FinishReason,
+				)
+			},
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name: "function call only response",
+			responsesResp: relaymodel.Response{
+				ID:        "resp_tool",
+				Model:     "gpt-5-mini",
+				Status:    relaymodel.ResponseStatusCompleted,
+				CreatedAt: 1781355958,
+				Output: []relaymodel.OutputItem{
+					{
+						ID:        "fc_123",
+						Type:      relaymodel.InputItemTypeFunctionCall,
+						CallID:    "call_123",
+						Name:      "get_weather",
+						Arguments: `{"location":"Boston"}`,
+					},
+				},
+				Usage: &relaymodel.ResponseUsage{
+					InputTokens:  12,
+					OutputTokens: 3,
+					TotalTokens:  15,
+				},
+			},
+			checkFunc: func(t *testing.T, chatResp relaymodel.TextResponse) {
+				t.Helper()
+				require.Len(t, chatResp.Choices, 1)
+
+				choice := chatResp.Choices[0]
+				assert.Equal(t, relaymodel.FinishReasonToolCalls, choice.FinishReason)
+				assert.Equal(t, relaymodel.RoleAssistant, choice.Message.Role)
+				assert.Empty(t, choice.Message.Content)
+				require.Len(t, choice.Message.ToolCalls, 1)
+
+				toolCall := choice.Message.ToolCalls[0]
+				assert.Equal(t, 0, toolCall.Index)
+				assert.Equal(t, "call_123", toolCall.ID)
+				assert.Equal(t, relaymodel.ToolChoiceTypeFunction, toolCall.Type)
+				assert.Equal(t, "get_weather", toolCall.Function.Name)
+				assert.Equal(t, `{"location":"Boston"}`, toolCall.Function.Arguments)
+			},
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name: "incomplete function call keeps incomplete finish reason",
+			responsesResp: relaymodel.Response{
+				ID:        "resp_tool_incomplete",
+				Model:     "gpt-5-mini",
+				Status:    relaymodel.ResponseStatusIncomplete,
+				CreatedAt: 1781355958,
+				Output: []relaymodel.OutputItem{
+					{
+						ID:        "fc_123",
+						Type:      relaymodel.InputItemTypeFunctionCall,
+						CallID:    "call_123",
+						Name:      "get_weather",
+						Arguments: `{"location":"Boston"}`,
+					},
+				},
+				IncompleteDetails: &relaymodel.IncompleteDetails{
+					Reason: "max_output_tokens",
+				},
+				Usage: &relaymodel.ResponseUsage{
+					InputTokens:  12,
+					OutputTokens: 3,
+					TotalTokens:  15,
+				},
+			},
+			checkFunc: func(t *testing.T, chatResp relaymodel.TextResponse) {
+				t.Helper()
+				require.Len(t, chatResp.Choices, 1)
+				assert.Equal(t, relaymodel.FinishReasonLength, chatResp.Choices[0].FinishReason)
+				require.Len(t, chatResp.Choices[0].Message.ToolCalls, 1)
+			},
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name: "incomplete unknown reason response",
+			responsesResp: relaymodel.Response{
+				ID:        "resp_unknown_incomplete",
+				Model:     "gpt-5-mini",
+				Status:    relaymodel.ResponseStatusIncomplete,
+				CreatedAt: 1781355958,
+				IncompleteDetails: &relaymodel.IncompleteDetails{
+					Reason: "unknown_reason",
+				},
+				Usage: &relaymodel.ResponseUsage{
+					InputTokens:  12,
+					OutputTokens: 3,
+					TotalTokens:  15,
+				},
+			},
+			checkFunc: func(t *testing.T, chatResp relaymodel.TextResponse) {
+				t.Helper()
+				require.Len(t, chatResp.Choices, 1)
+				assert.Equal(t, relaymodel.FinishReasonStop, chatResp.Choices[0].FinishReason)
 			},
 			expectedStatus: http.StatusOK,
 		},
@@ -435,6 +1071,7 @@ func TestConvertResponsesToChatCompletionResponse(t *testing.T) {
 			c, _ := gin.CreateTestContext(w)
 
 			m := &meta.Meta{
+				OriginModel: "client-gpt-5",
 				ActualModel: tt.responsesResp.Model,
 			}
 
@@ -446,14 +1083,590 @@ func TestConvertResponsesToChatCompletionResponse(t *testing.T) {
 			err = json.Unmarshal(w.Body.Bytes(), &chatResp)
 			require.NoError(t, err)
 
+			assert.Equal(t, "client-gpt-5", chatResp.Model)
 			tt.checkFunc(t, chatResp)
 		})
 	}
 }
 
-// Helper function
-func floatPtr(f float64) *float64 {
-	return &f
+func TestConvertResponsesToChatCompletionStreamResponseSkipsOutputItemDoneContent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	stream := strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"resp_123","object":"response","created_at":1780731105,"status":"in_progress","model":"gpt-5.1","output":[],"parallel_tool_calls":true,"store":false}}`,
+		"",
+		`data: {"type":"response.output_item.added","item":{"id":"msg_123","type":"message","role":"assistant","content":[]}}`,
+		"",
+		`data: {"type":"response.output_text.delta","item_id":"msg_123","output_index":0,"content_index":0,"delta":"Hello! What would you like to discuss or work on?"}`,
+		"",
+		`data: {"type":"response.output_item.done","item":{"id":"msg_123","type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello! What would you like to discuss or work on?"}]}}`,
+		"",
+		`data: {"type":"response.completed","response":{"id":"resp_123","object":"response","created_at":1780731105,"status":"completed","model":"gpt-5.1","output":[{"id":"msg_123","type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello! What would you like to discuss or work on?"}]}],"parallel_tool_calls":true,"store":false,"usage":{"input_tokens":7,"output_tokens":22,"total_tokens":29}}}`,
+		"",
+	}, "\n")
+
+	httpResp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       &mockReadCloser{Reader: bytes.NewReader([]byte(stream))},
+		Header:     make(http.Header),
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodPost,
+		"/v1/chat/completions",
+		nil,
+	)
+
+	m := &meta.Meta{
+		ActualModel: "gpt-5.1",
+	}
+
+	_, err := openai.ConvertResponsesToChatCompletionStreamResponse(m, c, httpResp)
+	require.Nil(t, err)
+
+	content := collectChatCompletionStreamContent(t, w.Body.String())
+	assert.Equal(t, "Hello! What would you like to discuss or work on?", content)
+	assert.Equal(
+		t,
+		1,
+		strings.Count(w.Body.String(), "Hello! What would you like to discuss or work on?"),
+	)
+	assert.Equal(t, 1, strings.Count(w.Body.String(), "data: [DONE]"))
+}
+
+func TestConvertResponsesToChatCompletionStreamResponseReturnsErrorBeforeDownstreamWrite(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+
+	stream := strings.Join([]string{
+		`event: response.created`,
+		`data: {"type":"response.created","response":{"id":"resp_123","object":"response","created_at":1781332973,"status":"in_progress","model":"gpt-5-mini","output":[],"parallel_tool_calls":true,"store":false}}`,
+		"",
+		`event: response.failed`,
+		`data: {"type":"response.failed","response":{"id":"resp_123","object":"response","created_at":1781332973,"status":"failed","model":"gpt-5-mini","output":[],"parallel_tool_calls":true,"store":false},"sequence_number":1}`,
+		"",
+		`event: error`,
+		`data: {"type":"error","error":{"type":"too_many_requests","code":"too_many_requests","message":"Too Many Requests","param":null},"sequence_number":2}`,
+		"",
+	}, "\n")
+
+	httpResp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       &mockReadCloser{Reader: bytes.NewReader([]byte(stream))},
+		Header:     make(http.Header),
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodPost,
+		"/v1/chat/completions",
+		nil,
+	)
+
+	m := &meta.Meta{
+		ActualModel: "gpt-5-mini",
+	}
+
+	result, err := openai.ConvertResponsesToChatCompletionStreamResponse(m, c, httpResp)
+	require.NotNil(t, err)
+	assert.Equal(t, http.StatusTooManyRequests, err.StatusCode())
+	assert.Equal(t, "resp_123", result.UpstreamID)
+	assert.Empty(t, w.Body.String())
+}
+
+func TestConvertResponsesToChatCompletionStreamResponsePreservesNumericStreamErrorStatus(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+
+	stream := strings.Join([]string{
+		`event: response.created`,
+		`data: {"type":"response.created","response":{"id":"resp_429","object":"response","created_at":1781332973,"status":"in_progress","model":"gpt-5-mini","output":[],"parallel_tool_calls":true,"store":false}}`,
+		"",
+		`event: error`,
+		`data: {"type":"error","error":{"type":"too_many_requests","code":429,"message":"Too Many Requests","param":null},"sequence_number":1}`,
+		"",
+	}, "\n")
+
+	httpResp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       &mockReadCloser{Reader: bytes.NewReader([]byte(stream))},
+		Header:     make(http.Header),
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodPost,
+		"/v1/chat/completions",
+		nil,
+	)
+
+	m := &meta.Meta{
+		ActualModel: "gpt-5-mini",
+	}
+
+	result, err := openai.ConvertResponsesToChatCompletionStreamResponse(m, c, httpResp)
+	require.NotNil(t, err)
+	assert.Equal(t, http.StatusTooManyRequests, err.StatusCode())
+	assert.Equal(t, "resp_429", result.UpstreamID)
+	assert.Empty(t, w.Body.String())
+}
+
+func TestConvertResponsesToChatCompletionStreamResponseFailedWithoutErrorDoesNotMarkAsyncUsage(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+
+	stream := strings.Join([]string{
+		`event: response.created`,
+		`data: {"type":"response.created","response":{"id":"resp_failed","object":"response","created_at":1781332973,"status":"in_progress","model":"gpt-5-mini","output":[],"parallel_tool_calls":true,"store":true}}`,
+		"",
+		`event: response.in_progress`,
+		`data: {"type":"response.in_progress","response":{"id":"resp_failed","object":"response","created_at":1781332973,"status":"in_progress","model":"gpt-5-mini","output":[],"parallel_tool_calls":true,"store":true}}`,
+		"",
+		`event: response.failed`,
+		`data: {"type":"response.failed","response":{"id":"resp_failed","object":"response","created_at":1781332973,"status":"failed","model":"gpt-5-mini","output":[],"parallel_tool_calls":true,"store":true},"sequence_number":2}`,
+		"",
+	}, "\n")
+
+	httpResp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       &mockReadCloser{Reader: bytes.NewReader([]byte(stream))},
+		Header:     make(http.Header),
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodPost,
+		"/v1/chat/completions",
+		nil,
+	)
+
+	m := &meta.Meta{
+		ActualModel: "gpt-5-mini",
+	}
+
+	result, err := openai.ConvertResponsesToChatCompletionStreamResponse(m, c, httpResp)
+	require.NotNil(t, err)
+	assert.Equal(t, http.StatusBadGateway, err.StatusCode())
+	assert.Equal(t, "resp_failed", result.UpstreamID)
+	assert.False(t, result.AsyncUsage)
+	assert.Empty(t, w.Body.String())
+}
+
+func TestConvertResponsesToChatCompletionStreamResponseMapsInvalidRequestErrorToBadRequest(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+
+	stream := strings.Join([]string{
+		`event: error`,
+		`data: {"type":"error","error":{"type":"invalid_request_error","code":"bad_response","message":"System messages are not allowed","param":null},"sequence_number":1}`,
+		"",
+	}, "\n")
+
+	httpResp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       &mockReadCloser{Reader: bytes.NewReader([]byte(stream))},
+		Header:     make(http.Header),
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodPost,
+		"/v1/chat/completions",
+		nil,
+	)
+
+	m := &meta.Meta{
+		ActualModel: "gpt-5.5",
+	}
+
+	result, err := openai.ConvertResponsesToChatCompletionStreamResponse(m, c, httpResp)
+	require.NotNil(t, err)
+	assert.Equal(t, http.StatusBadRequest, err.StatusCode())
+	assert.Empty(t, result.UpstreamID)
+	assert.Empty(t, w.Body.String())
+}
+
+func TestConvertResponsesToChatCompletionStreamResponseHandlesErrorAfterDownstreamWrite(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+
+	stream := strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"resp_123","object":"response","created_at":1781332973,"status":"in_progress","model":"gpt-5-mini","output":[],"parallel_tool_calls":true,"store":false}}`,
+		"",
+		`data: {"type":"response.output_text.delta","delta":"partial"}`,
+		"",
+		`event: error`,
+		`data: {"type":"error","error":{"type":"server_error","code":"server_error","message":"stream failed","param":null},"sequence_number":2}`,
+		"",
+		`data: {"type":"response.output_text.delta","delta":"late"}`,
+		"",
+		`data: {"type":"response.completed","response":{"id":"resp_123","object":"response","created_at":1781332973,"status":"completed","model":"gpt-5-mini","output":[],"parallel_tool_calls":true,"store":false}}`,
+		"",
+	}, "\n")
+
+	httpResp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       &mockReadCloser{Reader: bytes.NewReader([]byte(stream))},
+		Header:     make(http.Header),
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodPost,
+		"/v1/chat/completions",
+		nil,
+	)
+
+	m := &meta.Meta{
+		ActualModel: "gpt-5-mini",
+	}
+
+	_, err := openai.ConvertResponsesToChatCompletionStreamResponse(m, c, httpResp)
+	require.Nil(t, err)
+	assert.Equal(t, "partial", collectChatCompletionStreamContent(t, w.Body.String()))
+	assert.Equal(t, 1, strings.Count(w.Body.String(), "data: [DONE]"))
+	assert.NotContains(t, w.Body.String(), "late")
+}
+
+func TestConvertResponsesToChatCompletionStreamResponseHandlesIncompleteReasoningOnly(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+
+	stream := strings.Join([]string{
+		`event: response.created`,
+		`data: {"type":"response.created","response":{"id":"resp_incomplete","object":"response","created_at":1781355623,"status":"in_progress","model":"gpt-5-mini","output":[],"parallel_tool_calls":true,"store":false}}`,
+		"",
+		`event: response.output_item.added`,
+		`data: {"type":"response.output_item.added","item":{"id":"rs_1","type":"reasoning","summary":[]},"output_index":0,"sequence_number":2}`,
+		"",
+		`event: response.output_item.done`,
+		`data: {"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","summary":[]},"output_index":0,"sequence_number":3}`,
+		"",
+		`event: response.incomplete`,
+		`data: {"type":"response.incomplete","response":{"id":"resp_incomplete","object":"response","created_at":1781355623,"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"model":"gpt-5-mini","output":[{"id":"rs_1","type":"reasoning","summary":[]}],"parallel_tool_calls":true,"store":false,"usage":{"input_tokens":268,"output_tokens":192,"output_tokens_details":{"reasoning_tokens":192},"total_tokens":460}},"sequence_number":4}`,
+		"",
+	}, "\n")
+
+	httpResp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       &mockReadCloser{Reader: bytes.NewReader([]byte(stream))},
+		Header:     make(http.Header),
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodPost,
+		"/v1/chat/completions",
+		nil,
+	)
+
+	m := &meta.Meta{
+		ActualModel: "gpt-5-mini",
+	}
+
+	result, err := openai.ConvertResponsesToChatCompletionStreamResponse(m, c, httpResp)
+	require.Nil(t, err)
+	assert.Equal(t, "resp_incomplete", result.UpstreamID)
+	assert.Equal(t, int64(460), int64(result.Usage.TotalTokens))
+	assert.Equal(t, int64(192), int64(result.Usage.ReasoningTokens))
+
+	chunks := collectChatCompletionStreamChunks(t, w.Body.String())
+	require.Len(t, chunks, 2)
+
+	assert.Equal(t, relaymodel.RoleAssistant, chunks[0].Choices[0].Delta.Role)
+	assert.Equal(t, relaymodel.FinishReasonLength, chunks[1].Choices[0].FinishReason)
+	require.NotNil(t, chunks[1].Usage)
+	assert.Equal(t, int64(192), chunks[1].Usage.CompletionTokens)
+	assert.Equal(t, 1, strings.Count(w.Body.String(), "data: [DONE]"))
+}
+
+func TestConvertResponsesToChatCompletionStreamResponseMapsReasoningSummary(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+
+	stream := strings.Join([]string{
+		`event: response.created`,
+		`data: {"type":"response.created","response":{"id":"resp_reasoning","object":"response","created_at":1781355623,"status":"in_progress","model":"gpt-5-mini","output":[],"parallel_tool_calls":true,"store":false}}`,
+		"",
+		`event: response.reasoning_summary_text.delta`,
+		`data: {"type":"response.reasoning_summary_text.delta","delta":"Checking facts","sequence_number":2}`,
+		"",
+		`event: response.reasoning_summary_text.delta`,
+		`data: {"type":"response.reasoning_summary_text.delta","delta":" and constraints.","sequence_number":3}`,
+		"",
+		`event: response.output_text.delta`,
+		`data: {"type":"response.output_text.delta","delta":"Final answer","sequence_number":4}`,
+		"",
+		`event: response.completed`,
+		`data: {"type":"response.completed","response":{"id":"resp_reasoning","object":"response","created_at":1781355623,"status":"completed","model":"gpt-5-mini","output":[],"parallel_tool_calls":true,"store":false,"usage":{"input_tokens":5,"output_tokens":6,"total_tokens":11}},"sequence_number":5}`,
+		"",
+	}, "\n")
+
+	httpResp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       &mockReadCloser{Reader: bytes.NewReader([]byte(stream))},
+		Header:     make(http.Header),
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodPost,
+		"/v1/chat/completions",
+		nil,
+	)
+
+	m := &meta.Meta{
+		ActualModel: "gpt-5-mini",
+	}
+
+	_, err := openai.ConvertResponsesToChatCompletionStreamResponse(m, c, httpResp)
+	require.Nil(t, err)
+
+	chunks := collectChatCompletionStreamChunks(t, w.Body.String())
+	require.Len(t, chunks, 5)
+
+	assert.Equal(t, relaymodel.RoleAssistant, chunks[0].Choices[0].Delta.Role)
+	assert.Equal(t, "Checking facts", chunks[1].Choices[0].Delta.ReasoningContent)
+	assert.Equal(t, " and constraints.", chunks[2].Choices[0].Delta.ReasoningContent)
+	assert.Equal(t, "Final answer", chunks[3].Choices[0].Delta.Content)
+	assert.Equal(t, relaymodel.FinishReasonStop, chunks[4].Choices[0].FinishReason)
+	assert.Contains(t, w.Body.String(), `"reasoning_content":"Checking facts"`)
+}
+
+func TestConvertResponsesToChatCompletionStreamResponseHandlesIncompleteContentFilter(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+
+	stream := strings.Join([]string{
+		`event: response.created`,
+		`data: {"type":"response.created","response":{"id":"resp_content_filter","object":"response","created_at":1781355623,"status":"in_progress","model":"gpt-5-mini","output":[],"parallel_tool_calls":true,"store":false}}`,
+		"",
+		`event: response.incomplete`,
+		`data: {"type":"response.incomplete","response":{"id":"resp_content_filter","object":"response","created_at":1781355623,"status":"incomplete","incomplete_details":{"reason":"content_filter"},"model":"gpt-5-mini","output":[],"parallel_tool_calls":true,"store":false,"usage":{"input_tokens":12,"output_tokens":3,"total_tokens":15}},"sequence_number":1}`,
+		"",
+	}, "\n")
+
+	httpResp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       &mockReadCloser{Reader: bytes.NewReader([]byte(stream))},
+		Header:     make(http.Header),
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodPost,
+		"/v1/chat/completions",
+		nil,
+	)
+
+	m := &meta.Meta{
+		ActualModel: "gpt-5-mini",
+	}
+
+	_, err := openai.ConvertResponsesToChatCompletionStreamResponse(m, c, httpResp)
+	require.Nil(t, err)
+
+	chunks := collectChatCompletionStreamChunks(t, w.Body.String())
+	require.Len(t, chunks, 2)
+	assert.Equal(
+		t,
+		relaymodel.FinishReasonContentFilter,
+		chunks[1].Choices[0].FinishReason,
+	)
+	assert.Equal(t, 1, strings.Count(w.Body.String(), "data: [DONE]"))
+}
+
+func TestConvertResponsesToChatCompletionStreamResponseUsesToolCallsFinishReason(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+
+	stream := strings.Join([]string{
+		`event: response.created`,
+		`data: {"type":"response.created","response":{"id":"resp_tool","object":"response","created_at":1781355623,"status":"in_progress","model":"gpt-5-mini","output":[],"parallel_tool_calls":true,"store":false}}`,
+		"",
+		`event: response.output_item.added`,
+		`data: {"type":"response.output_item.added","item":{"id":"fc_123","type":"function_call","call_id":"call_123","name":"get_weather","arguments":"","status":"in_progress"},"output_index":0,"sequence_number":1}`,
+		"",
+		`event: response.function_call_arguments.delta`,
+		`data: {"type":"response.function_call_arguments.delta","item_id":"fc_123","output_index":0,"delta":"{\"location\":\"Boston\"}","sequence_number":2}`,
+		"",
+		`event: response.output_item.done`,
+		`data: {"type":"response.output_item.done","item":{"id":"fc_123","type":"function_call","call_id":"call_123","name":"get_weather","arguments":"{\"location\":\"Boston\"}","status":"completed"},"output_index":0,"sequence_number":3}`,
+		"",
+		`event: response.completed`,
+		`data: {"type":"response.completed","response":{"id":"resp_tool","object":"response","created_at":1781355623,"status":"completed","model":"gpt-5-mini","output":[{"id":"fc_123","type":"function_call","call_id":"call_123","name":"get_weather","arguments":"{\"location\":\"Boston\"}","status":"completed"}],"parallel_tool_calls":true,"store":false,"usage":{"input_tokens":12,"output_tokens":3,"total_tokens":15}},"sequence_number":4}`,
+		"",
+	}, "\n")
+
+	httpResp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       &mockReadCloser{Reader: bytes.NewReader([]byte(stream))},
+		Header:     make(http.Header),
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodPost,
+		"/v1/chat/completions",
+		nil,
+	)
+
+	m := &meta.Meta{
+		ActualModel: "gpt-5-mini",
+	}
+
+	_, err := openai.ConvertResponsesToChatCompletionStreamResponse(m, c, httpResp)
+	require.Nil(t, err)
+
+	chunks := collectChatCompletionStreamChunks(t, w.Body.String())
+	require.Len(t, chunks, 4)
+
+	require.Len(t, chunks[1].Choices[0].Delta.ToolCalls, 1)
+	assert.Equal(t, "call_123", chunks[1].Choices[0].Delta.ToolCalls[0].ID)
+	assert.Equal(t, "get_weather", chunks[1].Choices[0].Delta.ToolCalls[0].Function.Name)
+	assert.Equal(
+		t,
+		`{"location":"Boston"}`,
+		chunks[2].Choices[0].Delta.ToolCalls[0].Function.Arguments,
+	)
+	assert.Equal(t, relaymodel.FinishReasonToolCalls, chunks[3].Choices[0].FinishReason)
+	assert.Equal(t, 1, strings.Count(w.Body.String(), "data: [DONE]"))
+}
+
+func TestConvertResponsesToChatCompletionStreamResponseUsesOriginModelForEveryChunk(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+
+	stream := strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"resp_123","object":"response","created_at":1781332973,"status":"in_progress","model":"mapped-gpt-5","output":[],"parallel_tool_calls":true,"store":false}}`,
+		"",
+		`data: {"type":"response.output_text.delta","delta":"partial"}`,
+		"",
+		`data: {"type":"response.completed","response":{"id":"resp_123","object":"response","created_at":1781332973,"status":"completed","model":"mapped-gpt-5","output":[],"parallel_tool_calls":true,"store":false,"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+		"",
+	}, "\n")
+
+	httpResp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       &mockReadCloser{Reader: bytes.NewReader([]byte(stream))},
+		Header:     make(http.Header),
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodPost,
+		"/v1/chat/completions",
+		nil,
+	)
+
+	m := &meta.Meta{
+		OriginModel: "gpt-5",
+		ActualModel: "mapped-gpt-5",
+	}
+
+	_, err := openai.ConvertResponsesToChatCompletionStreamResponse(m, c, httpResp)
+	require.Nil(t, err)
+	assert.NotContains(t, w.Body.String(), "mapped-gpt-5")
+
+	chunkCount := 0
+	for line := range strings.SplitSeq(w.Body.String(), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data: ") || line == "data: [DONE]" {
+			continue
+		}
+
+		var chunk relaymodel.ChatCompletionsStreamResponse
+		require.NoError(t, json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &chunk))
+		assert.Equal(t, "gpt-5", chunk.Model)
+
+		chunkCount++
+	}
+
+	assert.GreaterOrEqual(t, chunkCount, 2)
+}
+
+func collectChatCompletionStreamContent(t *testing.T, body string) string {
+	t.Helper()
+
+	var builder strings.Builder
+
+	for line := range strings.SplitSeq(body, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data: ") || line == "data: [DONE]" {
+			continue
+		}
+
+		var chunk relaymodel.ChatCompletionsStreamResponse
+
+		err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &chunk)
+		require.NoError(t, err)
+
+		for _, choice := range chunk.Choices {
+			if content, ok := choice.Delta.Content.(string); ok {
+				builder.WriteString(content)
+			}
+		}
+	}
+
+	return builder.String()
+}
+
+func collectChatCompletionStreamChunks(
+	t *testing.T,
+	body string,
+) []relaymodel.ChatCompletionsStreamResponse {
+	t.Helper()
+
+	var chunks []relaymodel.ChatCompletionsStreamResponse
+
+	for line := range strings.SplitSeq(body, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data: ") || line == "data: [DONE]" {
+			continue
+		}
+
+		var chunk relaymodel.ChatCompletionsStreamResponse
+
+		err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &chunk)
+		require.NoError(t, err)
+
+		chunks = append(chunks, chunk)
+	}
+
+	return chunks
 }
 
 // mockReadCloser is a helper to create a ReadCloser from a Reader
@@ -500,7 +1713,10 @@ func TestConvertChatCompletionsRequest_WithToolsRequiredField(t *testing.T) {
 					_, hasRequired := params["required"]
 					assert.False(t, hasRequired, "required field should be removed when it's null")
 				} else {
-					t.Errorf("Parameters should be a map, got %T", openAIReq.Tools[0].Function.Parameters)
+					t.Errorf(
+						"Parameters should be a map, got %T",
+						openAIReq.Tools[0].Function.Parameters,
+					)
 				}
 			},
 		},
@@ -579,7 +1795,7 @@ func TestConvertChatCompletionsRequest_WithToolsRequiredField(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			httpReq := httptest.NewRequest(
+			httpReq, _ := http.NewRequestWithContext(context.Background(),
 				http.MethodPost,
 				"/v1/chat/completions",
 				bytes.NewReader([]byte(tt.request)),

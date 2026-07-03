@@ -11,12 +11,12 @@ import (
 // ImageInputTokensPerImage is the number of tokens per image for Gemini
 const ImageInputTokensPerImage = 560
 
-func GetGeminiRequestUsage(c *gin.Context, mc model.ModelConfig) (model.Usage, error) {
+func GetGeminiRequestUsage(c *gin.Context, mc model.ModelConfig) (RequestUsage, error) {
 	var geminiReq relaymodel.GeminiChatRequest
 
 	err := common.UnmarshalRequestReusable(c.Request, &geminiReq)
 	if err != nil {
-		return model.Usage{}, err
+		return RequestUsage{}, err
 	}
 
 	// Count tokens from all content parts
@@ -30,7 +30,7 @@ func GetGeminiRequestUsage(c *gin.Context, mc model.ModelConfig) (model.Usage, e
 				totalTokens += countTokensForText(part.Text, mc.Model)
 			}
 			// Count images in system instruction
-			if part.InlineData != nil {
+			if part.InlineData != nil || part.FileData != nil {
 				imageCount++
 			}
 		}
@@ -43,7 +43,7 @@ func GetGeminiRequestUsage(c *gin.Context, mc model.ModelConfig) (model.Usage, e
 				totalTokens += countTokensForText(part.Text, mc.Model)
 			}
 			// Count images
-			if part.InlineData != nil {
+			if part.InlineData != nil || part.FileData != nil {
 				imageCount++
 			}
 			// Function calls and responses also consume tokens
@@ -66,10 +66,10 @@ func GetGeminiRequestUsage(c *gin.Context, mc model.ModelConfig) (model.Usage, e
 	// Calculate image input tokens (each image is 560 tokens)
 	imageInputTokens := imageCount * ImageInputTokensPerImage
 
-	return model.Usage{
+	return NewRequestUsage(model.Usage{
 		InputTokens:      model.ZeroNullInt64(totalTokens + imageInputTokens),
 		ImageInputTokens: model.ZeroNullInt64(imageInputTokens),
-	}, nil
+	}), nil
 }
 
 // countTokensForText provides a rough estimate of token count

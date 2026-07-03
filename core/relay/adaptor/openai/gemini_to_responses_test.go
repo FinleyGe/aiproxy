@@ -2,6 +2,7 @@ package openai_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -65,7 +66,7 @@ func TestConvertGeminiToResponsesRequest_WithFunctionCalls(t *testing.T) {
 	reqBody, err := json.Marshal(geminiReq)
 	require.NoError(t, err)
 
-	httpReq := httptest.NewRequest(
+	httpReq, _ := http.NewRequestWithContext(context.Background(),
 		http.MethodPost,
 		"/v1beta/models/gpt-5-codex:streamGenerateContent",
 		bytes.NewReader(reqBody),
@@ -97,14 +98,14 @@ func TestConvertGeminiToResponsesRequest_WithFunctionCalls(t *testing.T) {
 		t,
 		4,
 		len(inputArray),
-		"Should have 4 items: system message, user message, function call, function result",
+		"Should have 4 items: developer message, user message, function call, function result",
 	)
 
-	// Verify system message
+	// Verify developer message
 	systemMsg, ok := inputArray[0].(map[string]any)
 	require.True(t, ok)
 	assert.Equal(t, "message", systemMsg["type"])
-	assert.Equal(t, "system", systemMsg["role"])
+	assert.Equal(t, "developer", systemMsg["role"])
 
 	// Verify user message
 	userMsg, ok := inputArray[1].(map[string]any)
@@ -166,6 +167,39 @@ func TestConvertGeminiToResponsesRequest_WithFunctionCalls(t *testing.T) {
 		functionResultItem["call_id"],
 		"Function call and output should have matching call_id",
 	)
+}
+
+func TestConvertGeminiToResponsesRequest_ReasoningEffortCompatibility(t *testing.T) {
+	t.Parallel()
+
+	requestJSON := `{
+		"generationConfig": {
+			"thinkingConfig": {
+				"thinkingBudget": 32768,
+				"includeThoughts": true
+			}
+		},
+		"contents": [{"role":"user","parts":[{"text":"hello"}]}]
+	}`
+	httpReq := httptest.NewRequestWithContext(t.Context(),
+		http.MethodPost,
+		"/v1beta/models/gemini-pro:generateContent",
+		bytes.NewReader([]byte(requestJSON)),
+	)
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	m := &meta.Meta{
+		ActualModel: "gpt-5.1",
+	}
+
+	result, err := openai.ConvertGeminiToResponsesRequest(m, httpReq)
+	require.NoError(t, err)
+
+	var responsesReq relaymodel.CreateResponseRequest
+	require.NoError(t, json.NewDecoder(result.Body).Decode(&responsesReq))
+	require.NotNil(t, responsesReq.Reasoning)
+	require.NotNil(t, responsesReq.Reasoning.Effort)
+	assert.Equal(t, "high", *responsesReq.Reasoning.Effort)
 }
 
 func TestConvertGeminiToResponsesRequest_WithToolsRequiredField(t *testing.T) {
@@ -232,7 +266,7 @@ func TestConvertGeminiToResponsesRequest_WithToolsRequiredField(t *testing.T) {
 	reqBody, err := json.Marshal(geminiReq)
 	require.NoError(t, err)
 
-	httpReq := httptest.NewRequest(
+	httpReq, _ := http.NewRequestWithContext(context.Background(),
 		http.MethodPost,
 		"/v1beta/models/gpt-5-codex:streamGenerateContent",
 		bytes.NewReader(reqBody),
@@ -310,7 +344,7 @@ func TestConvertGeminiToResponsesRequest_WithoutFunctionCalls(t *testing.T) {
 	reqBody, err := json.Marshal(geminiReq)
 	require.NoError(t, err)
 
-	httpReq := httptest.NewRequest(
+	httpReq, _ := http.NewRequestWithContext(context.Background(),
 		http.MethodPost,
 		"/v1beta/models/gpt-5-codex:streamGenerateContent",
 		bytes.NewReader(reqBody),
@@ -436,6 +470,7 @@ func TestConvertResponsesToGeminiResponse(t *testing.T) {
 			c, _ := gin.CreateTestContext(w)
 
 			m := &meta.Meta{
+				OriginModel: "client-gemini",
 				ActualModel: tt.responsesResp.Model,
 			}
 
@@ -450,7 +485,7 @@ func TestConvertResponsesToGeminiResponse(t *testing.T) {
 			require.NoError(t, err)
 
 			// Verify
-			assert.Equal(t, tt.responsesResp.Model, geminiResp.ModelVersion)
+			assert.Equal(t, "client-gemini", geminiResp.ModelVersion)
 			assert.NotEmpty(t, geminiResp.Candidates)
 
 			if tt.hasReasoning {
@@ -480,7 +515,7 @@ func TestConvertResponsesToGeminiResponse(t *testing.T) {
 			}
 
 			assert.NotNil(t, usage)
-			assert.Equal(t, tt.responsesResp.Usage.TotalTokens, int64(usage.TotalTokens))
+			assert.Equal(t, tt.responsesResp.Usage.TotalTokens, int64(usage.Usage.TotalTokens))
 		})
 	}
 }

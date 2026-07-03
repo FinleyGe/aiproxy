@@ -17,6 +17,7 @@ import (
 	"github.com/labring/aiproxy/core/relay/meta"
 	"github.com/labring/aiproxy/core/relay/plugin"
 	"github.com/labring/aiproxy/core/relay/plugin/noop"
+	"github.com/labring/aiproxy/core/relay/utils"
 )
 
 var _ plugin.Plugin = (*Plugin)(nil)
@@ -34,6 +35,7 @@ const lazyPatchesKey = "_lazy_patches"
 // Plugin implements JSON request patching functionality
 type Plugin struct {
 	noop.Noop
+	configCache utils.PluginConfigCache[Config]
 }
 
 // NewPatchPlugin creates a new patch plugin instance
@@ -99,9 +101,8 @@ func (p *Plugin) ConvertRequest(
 
 // loadConfig loads patch configuration from model config
 func (p *Plugin) loadConfig(meta *meta.Meta) *Config {
-	// Load plugin config from model config
-	var config Config
-	if err := meta.ModelConfig.LoadPluginConfig(PluginName, &config); err != nil {
+	config, err := p.configCache.Load(meta, PluginName, Config{})
+	if err != nil {
 		return &Config{}
 	}
 
@@ -115,7 +116,7 @@ func (p *Plugin) ApplyPatches(
 	config *Config,
 ) ([]byte, bool, error) {
 	// Parse JSON using sonic AST
-	node, err := sonic.Get(bodyBytes)
+	node, err := common.GetJSONNodeNoCopy(bodyBytes)
 	if err != nil {
 		// If it's not valid JSON, return as is
 		return bodyBytes, false, nil
@@ -404,7 +405,7 @@ func (p *Plugin) setValueAST(root *ast.Node, key string, value any) bool {
 		default:
 			// Try to marshal and parse
 			if bytes, err := sonic.Marshal(v); err == nil {
-				if node, err := sonic.Get(bytes); err == nil {
+				if node, err := common.GetJSONNodeNoCopy(bytes); err == nil {
 					newNode = node
 				} else {
 					return false
@@ -701,7 +702,7 @@ func (p *Plugin) createASTNode(value any) ast.Node {
 	default:
 		// Try to marshal and parse
 		if bytes, err := sonic.Marshal(v); err == nil {
-			if node, err := sonic.Get(bytes); err == nil {
+			if node, err := common.GetJSONNodeNoCopy(bytes); err == nil {
 				return node
 			}
 		}

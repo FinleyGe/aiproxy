@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -28,6 +29,98 @@ type chatCompletionStreamState struct {
 	currentToolCall   *relaymodel.ToolCall
 	currentToolCallID string
 	toolCallArgs      string
+	hasToolCall       bool
+}
+
+func responseModelName(meta *meta.Meta) string {
+	if meta == nil {
+		return ""
+	}
+
+	if meta.OriginModel != "" {
+		return meta.OriginModel
+	}
+
+	return meta.ActualModel
+}
+
+func responseToChatFinishReason(response *relaymodel.Response) relaymodel.FinishReason {
+	if response == nil {
+		return relaymodel.FinishReasonStop
+	}
+
+	if response.Status != relaymodel.ResponseStatusIncomplete {
+		return relaymodel.FinishReasonStop
+	}
+
+	if response.IncompleteDetails == nil {
+		return relaymodel.FinishReasonStop
+	}
+
+	switch response.IncompleteDetails.Reason {
+	case "max_output_tokens":
+		return relaymodel.FinishReasonLength
+	case "content_filter":
+		return relaymodel.FinishReasonContentFilter
+	default:
+		return relaymodel.FinishReasonStop
+	}
+}
+
+func responseReasoningSummaryText(response *relaymodel.Response) string {
+	if response == nil {
+		return ""
+	}
+
+	var summaryParts []string
+
+	for _, outputItem := range response.Output {
+		if outputItem.Type != relaymodel.InputItemTypeReasoning {
+			continue
+		}
+
+		summaryParts = append(summaryParts, reasoningSummaryText(outputItem.Summary)...)
+	}
+
+	return strings.Join(summaryParts, "\n")
+}
+
+func reasoningSummaryText(summary any) []string {
+	switch value := summary.(type) {
+	case string:
+		if value == "" {
+			return nil
+		}
+
+		return []string{value}
+	case []relaymodel.SummaryPart:
+		parts := make([]string, 0, len(value))
+		for _, part := range value {
+			if part.Text != "" {
+				parts = append(parts, part.Text)
+			}
+		}
+
+		return parts
+	case []any:
+		parts := make([]string, 0, len(value))
+		for _, item := range value {
+			switch typedItem := item.(type) {
+			case relaymodel.SummaryPart:
+				if typedItem.Text != "" {
+					parts = append(parts, typedItem.Text)
+				}
+			case map[string]any:
+				if text, ok := typedItem["text"].(string); ok && text != "" {
+					parts = append(parts, text)
+				}
+			}
+		}
+
+		return parts
+	default:
+		return nil
+	}
 }
 
 // handleResponseCreated handles response.created event for ChatCompletion
@@ -44,7 +137,7 @@ func (s *chatCompletionStreamState) handleResponseCreated(
 		ID:      s.messageID,
 		Object:  relaymodel.ChatCompletionChunkObject,
 		Created: event.Response.CreatedAt,
-		Model:   event.Response.Model,
+		Model:   responseModelName(s.meta),
 		Choices: []*relaymodel.ChatCompletionsStreamResponseChoice{
 			{
 				Index: 0,
@@ -68,12 +161,35 @@ func (s *chatCompletionStreamState) handleOutputTextDelta(
 		ID:      s.messageID,
 		Object:  relaymodel.ChatCompletionChunkObject,
 		Created: time.Now().Unix(),
-		Model:   s.meta.ActualModel,
+		Model:   responseModelName(s.meta),
 		Choices: []*relaymodel.ChatCompletionsStreamResponseChoice{
 			{
 				Index: 0,
 				Delta: relaymodel.Message{
 					Content: event.Delta,
+				},
+			},
+		},
+	}
+}
+
+func (s *chatCompletionStreamState) handleReasoningSummaryTextDelta(
+	event *relaymodel.ResponseStreamEvent,
+) *relaymodel.ChatCompletionsStreamResponse {
+	if event.Delta == "" {
+		return nil
+	}
+
+	return &relaymodel.ChatCompletionsStreamResponse{
+		ID:      s.messageID,
+		Object:  relaymodel.ChatCompletionChunkObject,
+		Created: time.Now().Unix(),
+		Model:   responseModelName(s.meta),
+		Choices: []*relaymodel.ChatCompletionsStreamResponseChoice{
+			{
+				Index: 0,
+				Delta: relaymodel.Message{
+					ReasoningContent: event.Delta,
 				},
 			},
 		},
@@ -90,6 +206,7 @@ func (s *chatCompletionStreamState) handleOutputItemAdded(
 
 	// Track function calls
 	if event.Item.Type == relaymodel.InputItemTypeFunctionCall {
+		s.hasToolCall = true
 		s.currentToolCallID = event.Item.ID
 		s.currentToolCall = &relaymodel.ToolCall{
 			ID:   event.Item.CallID,
@@ -106,7 +223,7 @@ func (s *chatCompletionStreamState) handleOutputItemAdded(
 			ID:      s.messageID,
 			Object:  relaymodel.ChatCompletionChunkObject,
 			Created: time.Now().Unix(),
-			Model:   s.meta.ActualModel,
+			Model:   responseModelName(s.meta),
 			Choices: []*relaymodel.ChatCompletionsStreamResponseChoice{
 				{
 					Index: 0,
@@ -133,7 +250,7 @@ func (s *chatCompletionStreamState) handleOutputItemAdded(
 			ID:      s.messageID,
 			Object:  relaymodel.ChatCompletionChunkObject,
 			Created: time.Now().Unix(),
-			Model:   s.meta.ActualModel,
+			Model:   responseModelName(s.meta),
 			Choices: []*relaymodel.ChatCompletionsStreamResponseChoice{
 				{
 					Index: 0,
@@ -164,7 +281,7 @@ func (s *chatCompletionStreamState) handleFunctionCallArgumentsDelta(
 		ID:      s.messageID,
 		Object:  relaymodel.ChatCompletionChunkObject,
 		Created: time.Now().Unix(),
-		Model:   s.meta.ActualModel,
+		Model:   responseModelName(s.meta),
 		Choices: []*relaymodel.ChatCompletionsStreamResponseChoice{
 			{
 				Index: 0,
@@ -186,9 +303,9 @@ func (s *chatCompletionStreamState) handleFunctionCallArgumentsDelta(
 // handleOutputItemDone handles response.output_item.done event for ChatCompletion
 func (s *chatCompletionStreamState) handleOutputItemDone(
 	event *relaymodel.ResponseStreamEvent,
-) *relaymodel.ChatCompletionsStreamResponse {
+) {
 	if event.Item == nil {
-		return nil
+		return
 	}
 
 	// Handle function call completion
@@ -205,32 +322,8 @@ func (s *chatCompletionStreamState) handleOutputItemDone(
 		s.toolCallArgs = ""
 
 		// No need to send another chunk - arguments already streamed
-		return nil
+		return
 	}
-
-	// Handle message content
-	if len(event.Item.Content) > 0 {
-		for _, content := range event.Item.Content {
-			if (content.Type == "text" || content.Type == "output_text") && content.Text != "" {
-				return &relaymodel.ChatCompletionsStreamResponse{
-					ID:      s.messageID,
-					Object:  relaymodel.ChatCompletionChunkObject,
-					Created: time.Now().Unix(),
-					Model:   s.meta.ActualModel,
-					Choices: []*relaymodel.ChatCompletionsStreamResponseChoice{
-						{
-							Index: 0,
-							Delta: relaymodel.Message{
-								Content: content.Text,
-							},
-						},
-					},
-				}
-			}
-		}
-	}
-
-	return nil
 }
 
 // handleResponseCompleted handles response.completed/done event for ChatCompletion
@@ -243,15 +336,20 @@ func (s *chatCompletionStreamState) handleResponseCompleted(
 
 	chatUsage := event.Response.Usage.ToChatUsage()
 
+	finishReason := responseToChatFinishReason(event.Response)
+	if finishReason == relaymodel.FinishReasonStop && s.hasToolCall {
+		finishReason = relaymodel.FinishReasonToolCalls
+	}
+
 	return &relaymodel.ChatCompletionsStreamResponse{
 		ID:      s.messageID,
 		Object:  relaymodel.ChatCompletionChunkObject,
 		Created: time.Now().Unix(),
-		Model:   s.meta.ActualModel,
+		Model:   responseModelName(s.meta),
 		Choices: []*relaymodel.ChatCompletionsStreamResponseChoice{
 			{
 				Index:        0,
-				FinishReason: relaymodel.FinishReasonStop,
+				FinishReason: finishReason,
 			},
 		},
 		Usage: &chatUsage,
@@ -265,7 +363,7 @@ func ConvertCompletionsRequest(
 ) (adaptor.ConvertResult, error) {
 	node, err := common.UnmarshalRequest2NodeReusable(req)
 	if err != nil {
-		return adaptor.ConvertResult{}, err
+		return adaptor.ConvertResult{}, convertRequestError(meta, err.Error())
 	}
 
 	for _, callback := range callback {
@@ -305,7 +403,7 @@ func ConvertChatCompletionsRequest(
 ) (adaptor.ConvertResult, error) {
 	node, err := common.UnmarshalRequest2NodeReusable(req)
 	if err != nil {
-		return adaptor.ConvertResult{}, err
+		return adaptor.ConvertResult{}, convertRequestError(meta, err.Error())
 	}
 
 	// Clean tool parameters (remove null/empty required fields)
@@ -320,13 +418,13 @@ func ConvertChatCompletionsRequest(
 		}
 
 		if err := callback(&node); err != nil {
-			return adaptor.ConvertResult{}, err
+			return adaptor.ConvertResult{}, convertRequestError(meta, err.Error())
 		}
 	}
 
 	if !doNotPatchStreamOptionsIncludeUsage {
 		if err := patchStreamOptions(&node); err != nil {
-			return adaptor.ConvertResult{}, err
+			return adaptor.ConvertResult{}, convertRequestError(meta, err.Error())
 		}
 	}
 
@@ -366,9 +464,9 @@ func patchStreamOptions(node *ast.Node) error {
 
 	streamOptionsNode := node.Get("stream_options")
 	if !streamOptionsNode.Exists() {
-		_, err = node.SetAny("stream_options", map[string]any{
-			"include_usage": true,
-		})
+		_, err = node.Set("stream_options", ast.NewObject([]ast.Pair{
+			ast.NewPair("include_usage", ast.NewBool(true)),
+		}))
 		return err
 	}
 
@@ -430,9 +528,9 @@ func StreamHandler(
 	c *gin.Context,
 	resp *http.Response,
 	preHandler PreHandler,
-) (model.Usage, adaptor.Error) {
+) (adaptor.DoResponseResult, adaptor.Error) {
 	if resp.StatusCode != http.StatusOK {
-		return model.Usage{}, ErrorHanlder(resp)
+		return adaptor.DoResponseResult{}, ErrorHanlder(resp)
 	}
 
 	defer resp.Body.Close()
@@ -441,10 +539,13 @@ func StreamHandler(
 
 	responseText := strings.Builder{}
 
-	scanner, cleanup := utils.NewStreamScanner(resp.Body, meta.ActualModel)
+	scanner, cleanup := utils.NewStreamScanner(resp.Body, meta.OriginModel, meta.ActualModel)
 	defer cleanup()
 
-	var usage relaymodel.ChatUsage
+	var (
+		usage      relaymodel.ChatUsage
+		upstreamID string
+	)
 
 	for scanner.Scan() {
 		data := scanner.Bytes()
@@ -457,7 +558,7 @@ func StreamHandler(
 			break
 		}
 
-		node, err := sonic.Get(data)
+		node, err := common.GetJSONNodeNoCopy(data)
 		if err != nil {
 			log.Error("error unmarshalling stream response: " + err.Error())
 			continue
@@ -481,6 +582,15 @@ func StreamHandler(
 			usage = *u
 
 			responseText.Reset()
+		}
+
+		// Extract upstream ID from response if available
+		if upstreamID == "" {
+			if idNode := node.Get("id"); idNode.Exists() && idNode.TypeSafe() != ast.V_NULL {
+				if id, err := idNode.String(); err == nil && id != "" {
+					upstreamID = id
+				}
+			}
 		}
 
 		for _, choice := range ch {
@@ -526,7 +636,10 @@ func StreamHandler(
 
 	render.OpenaiDone(c)
 
-	return usage.ToModelUsage(), nil
+	return adaptor.DoResponseResult{
+		Usage:      usage.ToModelUsage(),
+		UpstreamID: upstreamID,
+	}, nil
 }
 
 func GetUsageOrChoicesResponseFromNode(
@@ -576,9 +689,9 @@ func Handler(
 	c *gin.Context,
 	resp *http.Response,
 	preHandler PreHandler,
-) (model.Usage, adaptor.Error) {
+) (adaptor.DoResponseResult, adaptor.Error) {
 	if resp.StatusCode != http.StatusOK {
-		return model.Usage{}, ErrorHanlder(resp)
+		return adaptor.DoResponseResult{}, ErrorHanlder(resp)
 	}
 
 	defer resp.Body.Close()
@@ -587,7 +700,7 @@ func Handler(
 
 	node, err := common.UnmarshalResponse2Node(resp)
 	if err != nil {
-		return model.Usage{}, relaymodel.WrapperOpenAIError(
+		return adaptor.DoResponseResult{}, relaymodel.WrapperOpenAIError(
 			err,
 			"unmarshal_response_body_failed",
 			http.StatusInternalServerError,
@@ -597,7 +710,7 @@ func Handler(
 	if preHandler != nil {
 		err := preHandler(meta, &node)
 		if err != nil {
-			return model.Usage{}, relaymodel.WrapperOpenAIError(
+			return adaptor.DoResponseResult{}, relaymodel.WrapperOpenAIError(
 				err,
 				"pre_handler_failed",
 				http.StatusInternalServerError,
@@ -607,11 +720,19 @@ func Handler(
 
 	usage, choices, err := GetUsageOrChoicesResponseFromNode(&node)
 	if err != nil {
-		return model.Usage{}, relaymodel.WrapperOpenAIError(
+		return adaptor.DoResponseResult{}, relaymodel.WrapperOpenAIError(
 			err,
 			"unmarshal_response_body_failed",
 			http.StatusInternalServerError,
 		)
+	}
+
+	// Extract upstream ID from response if available
+	var upstreamID string
+	if idNode := node.Get("id"); idNode.Exists() && idNode.TypeSafe() != ast.V_NULL {
+		if id, err := idNode.String(); err == nil && id != "" {
+			upstreamID = id
+		}
 	}
 
 	if usage == nil ||
@@ -635,11 +756,14 @@ func Handler(
 
 		_, err = node.Set("usage", ast.NewAny(usage))
 		if err != nil {
-			return usage.ToModelUsage(), relaymodel.WrapperOpenAIError(
-				err,
-				"set_usage_failed",
-				http.StatusInternalServerError,
-			)
+			return adaptor.DoResponseResult{
+					Usage:      usage.ToModelUsage(),
+					UpstreamID: upstreamID,
+				}, relaymodel.WrapperOpenAIError(
+					err,
+					"set_usage_failed",
+					http.StatusInternalServerError,
+				)
 		}
 	} else if usage.TotalTokens != 0 && usage.PromptTokens == 0 { // some channels don't return prompt tokens & completion tokens
 		usage.PromptTokens = int64(meta.RequestUsage.InputTokens)
@@ -647,26 +771,39 @@ func Handler(
 
 		_, err = node.Set("usage", ast.NewAny(usage))
 		if err != nil {
-			return usage.ToModelUsage(), relaymodel.WrapperOpenAIError(err, "set_usage_failed", http.StatusInternalServerError)
+			return adaptor.DoResponseResult{
+					Usage:      usage.ToModelUsage(),
+					UpstreamID: upstreamID,
+				}, relaymodel.WrapperOpenAIError(
+					err,
+					"set_usage_failed",
+					http.StatusInternalServerError,
+				)
 		}
 	}
 
 	_, err = node.Set("model", ast.NewString(meta.OriginModel))
 	if err != nil {
-		return usage.ToModelUsage(), relaymodel.WrapperOpenAIError(
-			err,
-			"set_model_failed",
-			http.StatusInternalServerError,
-		)
+		return adaptor.DoResponseResult{
+				Usage:      usage.ToModelUsage(),
+				UpstreamID: upstreamID,
+			}, relaymodel.WrapperOpenAIError(
+				err,
+				"set_model_failed",
+				http.StatusInternalServerError,
+			)
 	}
 
 	newData, err := sonic.Marshal(&node)
 	if err != nil {
-		return usage.ToModelUsage(), relaymodel.WrapperOpenAIError(
-			err,
-			"marshal_response_body_failed",
-			http.StatusInternalServerError,
-		)
+		return adaptor.DoResponseResult{
+				Usage:      usage.ToModelUsage(),
+				UpstreamID: upstreamID,
+			}, relaymodel.WrapperOpenAIError(
+				err,
+				"marshal_response_body_failed",
+				http.StatusInternalServerError,
+			)
 	}
 
 	c.Writer.Header().Set("Content-Type", "application/json")
@@ -677,7 +814,10 @@ func Handler(
 		log.Warnf("write response body failed: %v", err)
 	}
 
-	return usage.ToModelUsage(), nil
+	return adaptor.DoResponseResult{
+		Usage:      usage.ToModelUsage(),
+		UpstreamID: upstreamID,
+	}, nil
 }
 
 // CleanToolParameters removes null or empty required field from tool parameters
@@ -774,6 +914,148 @@ func ConvertToolsToResponseTools(tools []relaymodel.Tool) []relaymodel.ResponseT
 	return responseTools
 }
 
+func convertLegacyFunctionsToResponseTools(functions any) []relaymodel.ResponseTool {
+	functionList, ok := functions.([]any)
+	if !ok || len(functionList) == 0 {
+		return nil
+	}
+
+	responseTools := make([]relaymodel.ResponseTool, 0, len(functionList))
+	for _, function := range functionList {
+		functionMap, ok := function.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		name, _ := functionMap["name"].(string)
+		if name == "" {
+			continue
+		}
+
+		description, _ := functionMap["description"].(string)
+
+		responseTools = append(responseTools, relaymodel.ResponseTool{
+			Type:        relaymodel.ToolChoiceTypeFunction,
+			Name:        name,
+			Description: description,
+			Parameters:  CleanToolParameters(functionMap["parameters"]),
+		})
+	}
+
+	return responseTools
+}
+
+func convertLegacyFunctionCallToResponseToolChoice(functionCall any) any {
+	switch value := functionCall.(type) {
+	case string:
+		switch value {
+		case "auto", "none":
+			return value
+		default:
+			return nil
+		}
+	case map[string]any:
+		name, _ := value["name"].(string)
+		if name == "" {
+			return nil
+		}
+
+		return map[string]any{
+			"type": "function",
+			"name": name,
+		}
+	default:
+		return nil
+	}
+}
+
+func convertChatToolChoiceToResponseToolChoice(toolChoice any) any {
+	toolChoiceMap, ok := toolChoice.(map[string]any)
+	if !ok {
+		return toolChoice
+	}
+
+	toolType, _ := toolChoiceMap["type"].(string)
+
+	functionMap, ok := toolChoiceMap["function"].(map[string]any)
+	if !ok || toolType != relaymodel.ToolChoiceTypeFunction {
+		return toolChoice
+	}
+
+	name, _ := functionMap["name"].(string)
+	if name == "" {
+		return toolChoice
+	}
+
+	return map[string]any{
+		"type": relaymodel.ToolChoiceTypeFunction,
+		"name": name,
+	}
+}
+
+func convertChatResponseFormatToResponseText(
+	responseFormat *relaymodel.ResponseFormat,
+) *relaymodel.ResponseText {
+	if responseFormat == nil || responseFormat.Type == "" {
+		return nil
+	}
+
+	format := relaymodel.ResponseTextFormat{
+		Type: responseFormat.Type,
+	}
+
+	if responseFormat.JSONSchema != nil {
+		format.Name = responseFormat.JSONSchema.Name
+		format.Schema = responseFormat.JSONSchema.Schema
+		format.Strict = responseFormat.JSONSchema.Strict
+		format.Description = responseFormat.JSONSchema.Description
+	}
+
+	return &relaymodel.ResponseText{Format: format}
+}
+
+func appendUniqueString(values []string, value string) []string {
+	if slices.Contains(values, value) {
+		return values
+	}
+
+	return append(values, value)
+}
+
+func appendChatContentPartToResponseInput(
+	inputItem *relaymodel.InputItem,
+	contentType relaymodel.InputContentType,
+	part map[string]any,
+) {
+	partType, _ := part["type"].(string)
+	switch partType {
+	case relaymodel.ContentTypeText:
+		text, _ := part["text"].(string)
+		if text == "" {
+			return
+		}
+
+		inputItem.Content = append(inputItem.Content, relaymodel.InputContent{
+			Type: contentType,
+			Text: text,
+		})
+	case relaymodel.ContentTypeImageURL:
+		imageURL, _ := part["image_url"].(map[string]any)
+
+		url, _ := imageURL["url"].(string)
+		if url == "" {
+			return
+		}
+
+		detail, _ := imageURL["detail"].(string)
+		inputItem.Content = append(inputItem.Content, relaymodel.InputContent{
+			Type:     "input_image",
+			ImageURL: url,
+			Detail:   detail,
+		})
+	}
+}
+
 // ConvertMessagesToInputItems converts Message array to InputItem array for Responses API
 func ConvertMessagesToInputItems(messages []relaymodel.Message) []relaymodel.InputItem {
 	inputItems := make([]relaymodel.InputItem, 0, len(messages))
@@ -839,8 +1121,11 @@ func ConvertMessagesToInputItems(messages []relaymodel.Message) []relaymodel.Inp
 		// Handle regular messages
 		role := msg.Role
 		// Tool role without ToolCallID is treated as user role
-		if role == relaymodel.RoleTool {
+		switch role {
+		case relaymodel.RoleTool:
 			role = relaymodel.RoleUser
+		case relaymodel.RoleSystem:
+			role = relaymodel.RoleDeveloper
 		}
 
 		inputItem := relaymodel.InputItem{
@@ -880,14 +1165,7 @@ func ConvertMessagesToInputItems(messages []relaymodel.Message) []relaymodel.Inp
 			// Array of content parts (multimodal)
 			for _, part := range content {
 				if partMap, ok := part.(map[string]any); ok {
-					if partType, ok := partMap["type"].(string); ok && partType == "text" {
-						if text, ok := partMap["text"].(string); ok {
-							inputItem.Content = append(inputItem.Content, relaymodel.InputContent{
-								Type: contentType,
-								Text: text,
-							})
-						}
-					}
+					appendChatContentPartToResponseInput(&inputItem, contentType, partMap)
 				}
 			}
 		}
@@ -930,6 +1208,21 @@ func ConvertChatCompletionToResponsesRequest(
 		responsesReq.TopP = chatReq.TopP
 	}
 
+	if chatReq.ResponseFormat != nil {
+		responsesReq.Text = convertChatResponseFormatToResponseText(chatReq.ResponseFormat)
+	}
+
+	if chatReq.TopLogprobs != nil {
+		responsesReq.TopLogprobs = chatReq.TopLogprobs
+	}
+
+	if chatReq.Logprobs != nil && *chatReq.Logprobs {
+		responsesReq.Include = appendUniqueString(
+			responsesReq.Include,
+			"message.output_text.logprobs",
+		)
+	}
+
 	if chatReq.MaxTokens > 0 {
 		responsesReq.MaxOutputTokens = &chatReq.MaxTokens
 	} else if chatReq.MaxCompletionTokens > 0 {
@@ -939,16 +1232,44 @@ func ConvertChatCompletionToResponsesRequest(
 	// Map tools
 	if len(chatReq.Tools) > 0 {
 		responsesReq.Tools = ConvertToolsToResponseTools(chatReq.Tools)
+	} else if chatReq.Functions != nil {
+		responsesReq.Tools = convertLegacyFunctionsToResponseTools(chatReq.Functions)
 	}
 
 	if chatReq.ToolChoice != nil {
-		responsesReq.ToolChoice = chatReq.ToolChoice
+		responsesReq.ToolChoice = convertChatToolChoiceToResponseToolChoice(chatReq.ToolChoice)
+	} else if chatReq.FunctionCall != nil {
+		responsesReq.ToolChoice = convertLegacyFunctionCallToResponseToolChoice(
+			chatReq.FunctionCall,
+		)
+	}
+
+	if chatReq.ParallelToolCalls != nil {
+		responsesReq.ParallelToolCalls = chatReq.ParallelToolCalls
+	}
+
+	// Map service tier
+	if chatReq.ServiceTier != "" {
+		responsesReq.ServiceTier = &chatReq.ServiceTier
+	}
+
+	// Map prompt cache key
+	if chatReq.PromptCacheKey != "" {
+		responsesReq.PromptCacheKey = &chatReq.PromptCacheKey
+	}
+
+	// Map prompt cache retention
+	if chatReq.PromptCacheRetention != "" {
+		responsesReq.PromptCacheRetention = &chatReq.PromptCacheRetention
 	}
 
 	// Map user
 	if chatReq.User != "" {
 		responsesReq.User = &chatReq.User
 	}
+
+	reasoning := utils.ParseOpenAIReasoning(&chatReq)
+	applyReasoningToResponsesRequestForModel(meta, &responsesReq, reasoning)
 
 	// Map metadata
 	if chatReq.Metadata != nil {
@@ -981,16 +1302,16 @@ func ConvertResponsesToChatCompletionResponse(
 	meta *meta.Meta,
 	c *gin.Context,
 	resp *http.Response,
-) (model.Usage, adaptor.Error) {
+) (adaptor.DoResponseResult, adaptor.Error) {
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return model.Usage{}, ErrorHanlder(resp)
+		return adaptor.DoResponseResult{}, ErrorHanlder(resp)
 	}
 
 	defer resp.Body.Close()
 
 	responseBody, err := common.GetResponseBody(resp)
 	if err != nil {
-		return model.Usage{}, relaymodel.WrapperOpenAIError(
+		return adaptor.DoResponseResult{}, relaymodel.WrapperOpenAIError(
 			err,
 			"read_response_body_failed",
 			http.StatusInternalServerError,
@@ -1001,7 +1322,7 @@ func ConvertResponsesToChatCompletionResponse(
 
 	err = sonic.Unmarshal(responseBody, &responsesResp)
 	if err != nil {
-		return model.Usage{}, relaymodel.WrapperOpenAIError(
+		return adaptor.DoResponseResult{}, relaymodel.WrapperOpenAIError(
 			err,
 			"unmarshal_response_body_failed",
 			http.StatusInternalServerError,
@@ -1013,52 +1334,93 @@ func ConvertResponsesToChatCompletionResponse(
 		ID:      responsesResp.ID,
 		Object:  relaymodel.ChatCompletionObject,
 		Created: responsesResp.CreatedAt,
-		Model:   responsesResp.Model,
+		Model:   responseModelName(meta),
 		Choices: []*relaymodel.TextResponseChoice{},
+		Usage:   relaymodel.ChatUsage{},
 	}
+
+	reasonContent := responseReasoningSummaryText(&responsesResp)
 
 	// Convert output items to choices
 	for _, outputItem := range responsesResp.Output {
-		choice := relaymodel.TextResponseChoice{
-			Index: 0, // Responses API doesn't have index, default to 0
-			Message: relaymodel.Message{
-				Role:    outputItem.Role,
-				Content: "",
-			},
-		}
-
-		// Convert content
-		var (
-			contentParts []string
-			toolCalls    []relaymodel.ToolCall
-		)
-
-		for _, content := range outputItem.Content {
-			if (content.Type == "text" || content.Type == "output_text") && content.Text != "" {
-				contentParts = append(contentParts, content.Text)
+		switch outputItem.Type {
+		case "", relaymodel.InputItemTypeMessage:
+			role := outputItem.Role
+			if role == "" {
+				role = relaymodel.RoleAssistant
 			}
-			// Add tool call conversion if needed in the future
-		}
 
-		if len(contentParts) > 0 {
-			choice.Message.Content = strings.Join(contentParts, "\n")
-		}
+			choice := relaymodel.TextResponseChoice{
+				Index: len(chatResp.Choices),
+				Message: relaymodel.Message{
+					Role:             role,
+					Content:          "",
+					ReasoningContent: reasonContent,
+				},
+			}
 
-		if len(toolCalls) > 0 {
-			choice.Message.ToolCalls = toolCalls
-		}
+			var contentParts []string
+			for _, content := range outputItem.Content {
+				if (content.Type == "text" || content.Type == "output_text") && content.Text != "" {
+					contentParts = append(contentParts, content.Text)
+				}
+			}
 
-		// Set finish reason based on status
-		switch responsesResp.Status {
-		case relaymodel.ResponseStatusCompleted:
-			choice.FinishReason = relaymodel.FinishReasonStop
-		case relaymodel.ResponseStatusIncomplete:
-			choice.FinishReason = relaymodel.FinishReasonLength
-		case relaymodel.ResponseStatusFailed:
-			choice.FinishReason = relaymodel.FinishReasonStop
-		}
+			if len(contentParts) > 0 {
+				choice.Message.Content = strings.Join(contentParts, "\n")
+			}
 
-		chatResp.Choices = append(chatResp.Choices, &choice)
+			choice.FinishReason = responseToChatFinishReason(&responsesResp)
+			chatResp.Choices = append(chatResp.Choices, &choice)
+			reasonContent = ""
+
+		case relaymodel.InputItemTypeFunctionCall:
+			toolCallID := outputItem.CallID
+			if toolCallID == "" {
+				toolCallID = outputItem.ID
+			}
+
+			finishReason := responseToChatFinishReason(&responsesResp)
+			if finishReason == relaymodel.FinishReasonStop {
+				finishReason = relaymodel.FinishReasonToolCalls
+			}
+
+			chatResp.Choices = append(chatResp.Choices, &relaymodel.TextResponseChoice{
+				Index: len(chatResp.Choices),
+				Message: relaymodel.Message{
+					Role:             relaymodel.RoleAssistant,
+					ReasoningContent: reasonContent,
+					ToolCalls: []relaymodel.ToolCall{
+						{
+							Index: 0,
+							ID:    toolCallID,
+							Type:  relaymodel.ToolChoiceTypeFunction,
+							Function: relaymodel.Function{
+								Name:      outputItem.Name,
+								Arguments: outputItem.Arguments.String(),
+							},
+						},
+					},
+				},
+				FinishReason: finishReason,
+			})
+			reasonContent = ""
+
+		default:
+			continue
+		}
+	}
+
+	if len(chatResp.Choices) == 0 {
+		chatResp.Choices = append(chatResp.Choices, &relaymodel.TextResponseChoice{
+			Index: 0,
+			Message: relaymodel.Message{
+				Role:             relaymodel.RoleAssistant,
+				Content:          "",
+				ReasoningContent: reasonContent,
+			},
+			FinishReason: responseToChatFinishReason(&responsesResp),
+		})
 	}
 
 	// Convert usage
@@ -1069,7 +1431,7 @@ func ConvertResponsesToChatCompletionResponse(
 	// Marshal and return
 	chatRespData, err := sonic.Marshal(chatResp)
 	if err != nil {
-		return model.Usage{}, relaymodel.WrapperOpenAIError(
+		return adaptor.DoResponseResult{}, relaymodel.WrapperOpenAIError(
 			err,
 			"marshal_response_body_failed",
 			http.StatusInternalServerError,
@@ -1080,11 +1442,90 @@ func ConvertResponsesToChatCompletionResponse(
 	c.Writer.Header().Set("Content-Length", strconv.Itoa(len(chatRespData)))
 	_, _ = c.Writer.Write(chatRespData)
 
-	if responsesResp.Usage != nil {
-		return responsesResp.Usage.ToModelUsage(), nil
+	return adaptor.DoResponseResult{
+		Usage:      responsesResp.ToModelUsage(),
+		UpstreamID: responsesResp.ID,
+		AsyncUsage: responseNeedsAsyncUsage(&responsesResp),
+	}, nil
+}
+
+type responsesStreamErrorState struct {
+	usage          model.Usage
+	responseID     string
+	lastResponse   *relaymodel.Response
+	pendingFailure *relaymodel.ResponseStreamEvent
+}
+
+func (s *responsesStreamErrorState) update(event *relaymodel.ResponseStreamEvent) {
+	if event.Response == nil {
+		return
 	}
 
-	return model.Usage{}, nil
+	if s.responseID == "" {
+		s.responseID = event.Response.ID
+	}
+
+	s.lastResponse = event.Response
+	s.usage = event.Response.ToModelUsage()
+}
+
+func (s *responsesStreamErrorState) result() adaptor.DoResponseResult {
+	asyncUsage := responseNeedsAsyncUsage(s.lastResponse)
+	if s.pendingFailure != nil {
+		asyncUsage = false
+	}
+
+	return adaptor.DoResponseResult{
+		Usage:      s.usage,
+		UpstreamID: s.responseID,
+		AsyncUsage: asyncUsage,
+	}
+}
+
+func (s *responsesStreamErrorState) errorBeforeEvent(
+	event *relaymodel.ResponseStreamEvent,
+) adaptor.Error {
+	if s.pendingFailure == nil {
+		return nil
+	}
+
+	if event.Type == relaymodel.EventError {
+		return responseStreamError(event)
+	}
+
+	return responseStreamError(s.pendingFailure)
+}
+
+func (s *responsesStreamErrorState) handleFailure(
+	event *relaymodel.ResponseStreamEvent,
+) (adaptor.Error, bool) {
+	if event.Type != relaymodel.EventResponseFailed && event.Type != relaymodel.EventError {
+		return nil, false
+	}
+
+	if event.Type == relaymodel.EventResponseFailed && event.Response != nil &&
+		event.Response.Error == nil {
+		s.update(event)
+
+		pendingEvent := *event
+		s.pendingFailure = &pendingEvent
+
+		return nil, true
+	}
+
+	return responseStreamError(event), true
+}
+
+func responseStreamEventCanDelay(eventType string) bool {
+	switch eventType {
+	case relaymodel.EventResponseCreated,
+		relaymodel.EventResponseInProgress,
+		relaymodel.EventResponseQueued,
+		relaymodel.EventKeepAlive:
+		return true
+	default:
+		return false
+	}
 }
 
 // ConvertResponsesToChatCompletionStreamResponse converts Responses API stream to ChatCompletion stream
@@ -1092,35 +1533,67 @@ func ConvertResponsesToChatCompletionStreamResponse(
 	meta *meta.Meta,
 	c *gin.Context,
 	resp *http.Response,
-) (model.Usage, adaptor.Error) {
+) (adaptor.DoResponseResult, adaptor.Error) {
 	if resp.StatusCode != http.StatusOK {
-		return model.Usage{}, ErrorHanlder(resp)
+		return adaptor.DoResponseResult{}, ErrorHanlder(resp)
 	}
 
 	defer resp.Body.Close()
 
 	log := common.GetLogger(c)
 
-	scanner, cleanup := utils.NewStreamScanner(resp.Body, meta.ActualModel)
+	scanner, cleanup := utils.NewStreamScanner(resp.Body, meta.OriginModel, meta.ActualModel)
 	defer cleanup()
 
-	var usage model.Usage
+	var (
+		usage               model.Usage
+		responseID          string
+		lastResponse        *relaymodel.Response
+		pendingInitialChunk *relaymodel.ChatCompletionsStreamResponse
+		wroteStream         bool
+	)
+
+	errorState := responsesStreamErrorState{}
 
 	state := &chatCompletionStreamState{
 		meta: meta,
 		c:    c,
 	}
+	stopStream := false
 
-	for scanner.Scan() {
+	var writeChatStreamResp func(*relaymodel.ChatCompletionsStreamResponse)
+
+	writeChatStreamResp = func(chatStreamResp *relaymodel.ChatCompletionsStreamResponse) {
+		if chatStreamResp == nil {
+			return
+		}
+
+		if pendingInitialChunk != nil {
+			initialChunk := pendingInitialChunk
+			pendingInitialChunk = nil
+
+			writeChatStreamResp(initialChunk)
+		}
+
+		chunkData, err := sonic.Marshal(chatStreamResp)
+		if err != nil {
+			log.Error("error marshalling chat stream response: " + err.Error())
+			return
+		}
+
+		render.OpenaiBytesData(c, chunkData)
+
+		wroteStream = true
+	}
+
+	for scanner.Scan() && !stopStream {
 		data := scanner.Bytes()
+
 		if !render.IsValidSSEData(data) {
 			continue
 		}
 
 		data = render.ExtractSSEData(data)
-		if render.IsSSEDone(data) {
-			break
-		}
 
 		// Parse the stream event
 		var event relaymodel.ResponseStreamEvent
@@ -1131,43 +1604,180 @@ func ConvertResponsesToChatCompletionStreamResponse(
 			continue
 		}
 
+		if event.Response != nil {
+			if responseID == "" {
+				responseID = event.Response.ID
+			}
+
+			lastResponse = event.Response
+			usage = event.Response.ToModelUsage()
+		}
+
+		errorState.usage = usage
+		errorState.responseID = responseID
+		errorState.lastResponse = lastResponse
+
+		if err := errorState.errorBeforeEvent(&event); err != nil {
+			return errorState.result(), err
+		}
+
 		// Handle event and get response
 		var chatStreamResp *relaymodel.ChatCompletionsStreamResponse
 
 		switch event.Type {
 		case relaymodel.EventResponseCreated:
-			chatStreamResp = state.handleResponseCreated(&event)
+			pendingInitialChunk = state.handleResponseCreated(&event)
 		case relaymodel.EventOutputTextDelta:
 			chatStreamResp = state.handleOutputTextDelta(&event)
+		case relaymodel.EventReasoningSummaryTextDelta:
+			chatStreamResp = state.handleReasoningSummaryTextDelta(&event)
 		case relaymodel.EventOutputItemAdded:
 			chatStreamResp = state.handleOutputItemAdded(&event)
 		case relaymodel.EventFunctionCallArgumentsDelta:
 			chatStreamResp = state.handleFunctionCallArgumentsDelta(&event)
 		case relaymodel.EventOutputItemDone:
-			chatStreamResp = state.handleOutputItemDone(&event)
-		case relaymodel.EventResponseCompleted, relaymodel.EventResponseDone:
-			if event.Response != nil && event.Response.Usage != nil {
-				usage = event.Response.Usage.ToModelUsage()
+			state.handleOutputItemDone(&event)
+		case relaymodel.EventResponseCompleted,
+			relaymodel.EventResponseIncomplete,
+			relaymodel.EventResponseDone:
+			chatStreamResp = state.handleResponseCompleted(&event)
+		case relaymodel.EventResponseFailed, relaymodel.EventError:
+			if wroteStream {
+				log.Error(
+					"response stream failed after data was sent: " + responseStreamErrorMessage(
+						&event,
+					),
+				)
+
+				stopStream = true
+
+				break
 			}
 
-			chatStreamResp = state.handleResponseCompleted(&event)
-		}
-
-		// Send the converted chunk
-		if chatStreamResp != nil {
-			chunkData, err := sonic.Marshal(chatStreamResp)
-			if err != nil {
-				log.Error("error marshalling chat stream response: " + err.Error())
+			err, handled := errorState.handleFailure(&event)
+			if handled && err == nil {
 				continue
 			}
 
-			render.OpenaiBytesData(c, chunkData)
+			if handled {
+				return errorState.result(), err
+			}
 		}
+
+		writeChatStreamResp(chatStreamResp)
 	}
 
 	if err := scanner.Err(); err != nil {
 		log.Error("error reading response stream: " + err.Error())
 	}
 
-	return usage, nil
+	if errorState.pendingFailure != nil && !wroteStream {
+		return errorState.result(), responseStreamError(errorState.pendingFailure)
+	}
+
+	if wroteStream {
+		render.OpenaiDone(c)
+	}
+
+	return adaptor.DoResponseResult{
+		Usage:      usage,
+		UpstreamID: responseID,
+		AsyncUsage: responseNeedsAsyncUsage(lastResponse),
+	}, nil
+}
+
+func responseStreamError(event *relaymodel.ResponseStreamEvent) adaptor.Error {
+	openAIError := relaymodel.OpenAIError{
+		Message: responseStreamErrorMessage(event),
+		Type:    relaymodel.ErrorTypeUpstream,
+		Code:    relaymodel.ErrorCodeBadResponse,
+	}
+	statusCode := http.StatusBadGateway
+
+	if event.Error != nil {
+		openAIError = *event.Error
+		if openAIError.Type == "" {
+			openAIError.Type = relaymodel.ErrorTypeUpstream
+		}
+
+		if openAIError.Message == "" {
+			openAIError.Message = responseStreamErrorMessage(event)
+		}
+
+		if openAIError.Code == nil {
+			openAIError.Code = relaymodel.ErrorCodeBadResponse
+		}
+	}
+
+	if event.Response != nil && event.Response.Error != nil {
+		openAIError.Message = event.Response.Error.Message
+		if event.Response.Error.Code != "" {
+			openAIError.Code = event.Response.Error.Code
+		}
+	}
+
+	if status, ok := streamErrorStatusCode(openAIError.Code); ok {
+		statusCode = status
+	} else if status, ok := streamErrorStatusCode(openAIError.Type); ok {
+		statusCode = status
+	} else if status, ok := streamErrorStatusCode(openAIError.Message); ok {
+		statusCode = status
+	}
+
+	return relaymodel.NewOpenAIError(statusCode, openAIError)
+}
+
+func streamErrorStatusCode(code any) (int, bool) {
+	switch value := code.(type) {
+	case int:
+		return statusCodeFromNumericCode(value)
+	case int64:
+		return statusCodeFromNumericCode(int(value))
+	case float64:
+		if value == float64(int(value)) {
+			return statusCodeFromNumericCode(int(value))
+		}
+	case string:
+		if status, err := strconv.Atoi(value); err == nil {
+			return statusCodeFromNumericCode(status)
+		}
+
+		switch value {
+		case "too_many_requests", "rate_limit_exceeded":
+			return http.StatusTooManyRequests, true
+		case "invalid_request_error", "bad_request", "bad_request_error", "invalid_request":
+			return http.StatusBadRequest, true
+		}
+
+		lowerValue := strings.ToLower(value)
+		if strings.Contains(lowerValue, "system messages are not allowed") {
+			return http.StatusBadRequest, true
+		}
+	}
+
+	return 0, false
+}
+
+func statusCodeFromNumericCode(code int) (int, bool) {
+	if code >= http.StatusBadRequest && code < 600 {
+		return code, true
+	}
+
+	return 0, false
+}
+
+func responseStreamErrorMessage(event *relaymodel.ResponseStreamEvent) string {
+	if event.Error != nil && event.Error.Message != "" {
+		return event.Error.Message
+	}
+
+	if event.Response != nil && event.Response.Error != nil && event.Response.Error.Message != "" {
+		return event.Response.Error.Message
+	}
+
+	if event.Type != "" {
+		return "response stream failed: " + event.Type
+	}
+
+	return "response stream failed"
 }

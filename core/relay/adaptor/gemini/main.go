@@ -78,7 +78,10 @@ func ensureThoughtSignature(node *ast.Node) error {
 			} else {
 				val, _ := thoughtSignature.String()
 				if val == "" {
-					_, _ = part.Set("thoughtSignature", ast.NewString(ThoughtSignatureDummySkipValidator))
+					_, _ = part.Set(
+						"thoughtSignature",
+						ast.NewString(ThoughtSignatureDummySkipValidator),
+					)
 				}
 			}
 
@@ -191,16 +194,16 @@ func NativeHandler(
 	meta *meta.Meta,
 	c *gin.Context,
 	resp *http.Response,
-) (model.Usage, adaptor.Error) {
+) (adaptor.DoResponseResult, adaptor.Error) {
 	if resp.StatusCode != http.StatusOK {
-		return model.Usage{}, ErrorHandler(resp)
+		return adaptor.DoResponseResult{}, ErrorHandler(resp)
 	}
 
 	defer resp.Body.Close()
 
 	var geminiResponse relaymodel.GeminiChatResponse
 	if err := sonic.ConfigDefault.NewDecoder(resp.Body).Decode(&geminiResponse); err != nil {
-		return model.Usage{}, relaymodel.WrapperOpenAIError(
+		return adaptor.DoResponseResult{}, relaymodel.WrapperOpenAIError(
 			err,
 			"unmarshal_response_body_failed",
 			http.StatusInternalServerError,
@@ -218,7 +221,7 @@ func NativeHandler(
 	// Pass through the response as-is
 	jsonResponse, err := sonic.Marshal(geminiResponse)
 	if err != nil {
-		return usage, relaymodel.WrapperOpenAIError(
+		return adaptor.DoResponseResult{Usage: usage}, relaymodel.WrapperOpenAIError(
 			err,
 			"marshal_response_body_failed",
 			http.StatusInternalServerError,
@@ -229,7 +232,7 @@ func NativeHandler(
 	c.Writer.Header().Set("Content-Length", strconv.Itoa(len(jsonResponse)))
 	_, _ = c.Writer.Write(jsonResponse)
 
-	return usage, nil
+	return adaptor.DoResponseResult{Usage: usage}, nil
 }
 
 // NativeStreamHandler handles streaming responses in native Gemini format (passthrough)
@@ -237,9 +240,9 @@ func NativeStreamHandler(
 	meta *meta.Meta,
 	c *gin.Context,
 	resp *http.Response,
-) (model.Usage, adaptor.Error) {
+) (adaptor.DoResponseResult, adaptor.Error) {
 	if resp.StatusCode != http.StatusOK {
-		return model.Usage{}, ErrorHandler(resp)
+		return adaptor.DoResponseResult{}, ErrorHandler(resp)
 	}
 
 	defer resp.Body.Close()
@@ -250,8 +253,9 @@ func NativeStreamHandler(
 	defer cleanup()
 
 	usage := model.Usage{}
-
-	var websearchCount int64
+	webSearchQueries := map[string]struct{}{}
+	webSearchGrounded := false
+	webSearchGemini3 := isGemini3Meta(meta)
 
 	for scanner.Scan() {
 		data := scanner.Bytes()
@@ -267,10 +271,13 @@ func NativeStreamHandler(
 			if geminiResp.UsageMetadata != nil {
 				usage = geminiResp.UsageMetadata.ToModelUsage()
 			}
-			// Get web search count from grounding metadata
-			if webSearchCount := geminiResp.GetWebSearchCount(); webSearchCount > 0 {
-				websearchCount += webSearchCount
-			}
+
+			trackGeminiWebSearch(
+				&geminiResp,
+				webSearchQueries,
+				&webSearchGrounded,
+				&webSearchGemini3,
+			)
 		}
 
 		// Pass through the data as-is
@@ -281,7 +288,9 @@ func NativeStreamHandler(
 		log.Error("error reading stream: " + err.Error())
 	}
 
-	usage.WebSearchCount += model.ZeroNullInt64(websearchCount)
+	usage.WebSearchCount = model.ZeroNullInt64(
+		geminiWebSearchCount(webSearchQueries, webSearchGrounded, webSearchGemini3),
+	)
 
-	return usage, nil
+	return adaptor.DoResponseResult{Usage: usage}, nil
 }

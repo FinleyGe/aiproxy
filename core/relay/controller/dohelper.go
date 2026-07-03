@@ -11,14 +11,13 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/labring/aiproxy/core/common"
 	"github.com/labring/aiproxy/core/common/conv"
-	"github.com/labring/aiproxy/core/model"
 	"github.com/labring/aiproxy/core/relay/adaptor"
 	"github.com/labring/aiproxy/core/relay/meta"
-	"github.com/labring/aiproxy/core/relay/mode"
 	relaymodel "github.com/labring/aiproxy/core/relay/model"
 	log "github.com/sirupsen/logrus"
 )
@@ -31,6 +30,7 @@ const (
 type responseWriter struct {
 	gin.ResponseWriter
 	body        *bytes.Buffer
+	bodyLimit   int
 	firstByteAt time.Time
 }
 
@@ -39,10 +39,12 @@ func (rw *responseWriter) Write(b []byte) (int, error) {
 		rw.firstByteAt = time.Now()
 	}
 
-	if rw.body.Len()+len(b) <= maxBufferSize {
-		rw.body.Write(b)
-	} else {
-		rw.body.Write(b[:maxBufferSize-rw.body.Len()])
+	if rw.body != nil && rw.bodyLimit > rw.body.Len() {
+		remain := min(rw.bodyLimit-rw.body.Len(), len(b))
+
+		if remain > 0 {
+			rw.body.Write(b[:remain])
+		}
 	}
 
 	return rw.ResponseWriter.Write(b)
@@ -77,10 +79,17 @@ func putBuffer(buf *bytes.Buffer) {
 	bufferPool.Put(buf)
 }
 
-type RequestDetail struct {
+type BodyDetail struct {
 	RequestBody  string
 	ResponseBody string
 	FirstByteAt  time.Time
+}
+
+type BodyDetailOption struct {
+	IncludeRequestBody  bool
+	IncludeResponseBody bool
+	MaxRequestBodySize  int64
+	MaxResponseBodySize int64
 }
 
 func DoHelper(
@@ -88,15 +97,19 @@ func DoHelper(
 	c *gin.Context,
 	meta *meta.Meta,
 	store adaptor.Store,
+	opts ...BodyDetailOption,
 ) (
-	model.Usage,
-	*RequestDetail,
+	adaptor.DoResponseResult,
+	*BodyDetail,
 	adaptor.Error,
 ) {
-	detail := RequestDetail{}
+	detail := BodyDetail{}
+	detailOption := mergeBodyDetailOptions(opts...)
 
-	if err := storeRequestBody(meta, c, &detail); err != nil {
-		return model.Usage{}, nil, err
+	if requestBody, err := requestBodyDetail(c, detailOption); err != nil {
+		common.GetLogger(c).Warnf("get request body detail failed: %v", err)
+	} else {
+		detail.RequestBody = requestBody
 	}
 
 	// donot use c.Request.Context() because it will be canceled by the client
@@ -104,7 +117,7 @@ func DoHelper(
 
 	resp, err := prepareAndDoRequest(ctx, a, c, meta, store)
 	if err != nil {
-		return model.Usage{}, &detail, err
+		return adaptor.DoResponseResult{}, &detail, err
 	}
 
 	if resp == nil {
@@ -116,51 +129,31 @@ func DoHelper(
 		respBody, _ := relayErr.MarshalJSON()
 		detail.ResponseBody = conv.BytesToString(respBody)
 
-		return model.Usage{}, &detail, relayErr
+		return adaptor.DoResponseResult{}, &detail, relayErr
 	}
 
 	if resp.Body != nil {
 		defer resp.Body.Close()
 	}
 
-	usage, relayErr := handleResponse(a, c, meta, store, resp, &detail)
+	result, relayErr := handleResponse(a, c, meta, store, resp, &detail, detailOption)
 	if relayErr != nil {
-		return model.Usage{}, &detail, relayErr
+		return adaptor.DoResponseResult{}, &detail, relayErr
 	}
 
 	log := common.GetLogger(c)
-	updateUsageMetrics(usage, log)
+	updateUsageMetrics(result, log)
+
+	if result.UpstreamID != "" {
+		log.Data["upstream_id"] = result.UpstreamID
+	}
 
 	if !detail.FirstByteAt.IsZero() {
 		ttfb := detail.FirstByteAt.Sub(meta.RequestAt)
 		log.Data["ttfb"] = common.TruncateDuration(ttfb).String()
 	}
 
-	return usage, &detail, nil
-}
-
-func storeRequestBody(meta *meta.Meta, c *gin.Context, detail *RequestDetail) adaptor.Error {
-	switch {
-	case meta.Mode == mode.AudioTranscription,
-		meta.Mode == mode.AudioTranslation,
-		meta.Mode == mode.ImagesEdits:
-		return nil
-	case !common.IsJSONContentType(c.GetHeader("Content-Type")):
-		return nil
-	default:
-		reqBody, err := common.GetRequestBodyReusable(c.Request)
-		if err != nil {
-			return relaymodel.WrapperErrorWithMessage(
-				meta.Mode,
-				http.StatusBadRequest,
-				"get request body failed: "+err.Error(),
-			)
-		}
-
-		detail.RequestBody = conv.BytesToString(reqBody)
-
-		return nil
-	}
+	return result, &detail, nil
 }
 
 func prepareAndDoRequest(
@@ -174,16 +167,24 @@ func prepareAndDoRequest(
 
 	convertResult, err := a.ConvertRequest(meta, store, c.Request)
 	if err != nil {
-		return nil, relaymodel.WrapperErrorWithMessage(
-			meta.Mode,
-			http.StatusBadRequest,
-			"convert request failed: "+err.Error(),
-		)
+		return nil, mapRequestError(meta, err, http.StatusBadRequest, "convert request failed")
 	}
 
-	if closer, ok := convertResult.Body.(io.Closer); ok {
-		defer closer.Close()
-	}
+	var req *http.Request
+	defer func() {
+		if req != nil {
+			if req.Body != nil {
+				_ = req.Body.Close()
+				req.Body = http.NoBody
+			}
+
+			req.GetBody = nil
+
+			return
+		}
+
+		closeRequestReader(convertResult.Body)
+	}()
 
 	if meta.Channel.BaseURL == "" {
 		meta.Channel.BaseURL = a.DefaultBaseURL()
@@ -200,7 +201,7 @@ func prepareAndDoRequest(
 
 	log.Debugf("request url: %s %s", fullRequestURL.Method, fullRequestURL.URL)
 
-	req, err := http.NewRequestWithContext(
+	req, err = http.NewRequestWithContext(
 		ctx,
 		fullRequestURL.Method,
 		fullRequestURL.URL,
@@ -219,6 +220,69 @@ func prepareAndDoRequest(
 	}
 
 	return doRequest(a, c, meta, store, req)
+}
+
+func closeRequestReader(r io.Reader) {
+	if closer, ok := r.(io.Closer); ok {
+		_ = closer.Close()
+	}
+}
+
+func mapRequestError(
+	meta *meta.Meta,
+	err error,
+	fallbackStatusCode int,
+	fallbackMessage string,
+) adaptor.Error {
+	if adaptorErr, ok := errors.AsType[adaptor.Error](err); ok {
+		return adaptorErr
+	}
+
+	if errors.Is(err, context.Canceled) {
+		return relaymodel.WrapperErrorWithMessage(
+			meta.Mode,
+			http.StatusBadRequest,
+			"request canceled by client: "+err.Error(),
+		)
+	}
+
+	if errors.Is(err, context.DeadlineExceeded) {
+		return relaymodel.WrapperErrorWithMessage(
+			meta.Mode,
+			http.StatusRequestTimeout,
+			"timeout with deadline exceeded: "+err.Error(),
+		)
+	}
+
+	if errors.Is(err, io.EOF) {
+		return relaymodel.WrapperErrorWithMessage(
+			meta.Mode,
+			http.StatusServiceUnavailable,
+			"request eof: "+err.Error(),
+		)
+	}
+
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return relaymodel.WrapperErrorWithMessage(
+			meta.Mode,
+			http.StatusInternalServerError,
+			"request unexpected eof: "+err.Error(),
+		)
+	}
+
+	if strings.Contains(err.Error(), "timeout awaiting response headers") {
+		return relaymodel.WrapperErrorWithMessage(
+			meta.Mode,
+			http.StatusRequestTimeout,
+			"request timeout: "+err.Error(),
+		)
+	}
+
+	return relaymodel.WrapperErrorWithMessage(
+		meta.Mode,
+		fallbackStatusCode,
+		fallbackMessage+": "+err.Error(),
+	)
 }
 
 func setupRequestHeader(
@@ -251,58 +315,7 @@ func doRequest(
 ) (*http.Response, adaptor.Error) {
 	resp, err := a.DoRequest(meta, store, c, req)
 	if err != nil {
-		var adaptorErr adaptor.Error
-
-		ok := errors.As(err, &adaptorErr)
-		if ok {
-			return nil, adaptorErr
-		}
-
-		if errors.Is(err, context.Canceled) {
-			return nil, relaymodel.WrapperErrorWithMessage(
-				meta.Mode,
-				http.StatusBadRequest,
-				"request canceled by client: "+err.Error(),
-			)
-		}
-
-		if errors.Is(err, context.DeadlineExceeded) {
-			return nil, relaymodel.WrapperErrorWithMessage(
-				meta.Mode,
-				http.StatusRequestTimeout,
-				"request timeout: "+err.Error(),
-			)
-		}
-
-		if errors.Is(err, io.EOF) {
-			return nil, relaymodel.WrapperErrorWithMessage(
-				meta.Mode,
-				http.StatusServiceUnavailable,
-				"request eof: "+err.Error(),
-			)
-		}
-
-		if errors.Is(err, io.ErrUnexpectedEOF) {
-			return nil, relaymodel.WrapperErrorWithMessage(
-				meta.Mode,
-				http.StatusInternalServerError,
-				"request unexpected eof: "+err.Error(),
-			)
-		}
-
-		if strings.Contains(err.Error(), "timeout awaiting response headers") {
-			return nil, relaymodel.WrapperErrorWithMessage(
-				meta.Mode,
-				http.StatusRequestTimeout,
-				"request timeout: "+err.Error(),
-			)
-		}
-
-		return nil, relaymodel.WrapperErrorWithMessage(
-			meta.Mode,
-			http.StatusInternalServerError,
-			"request error: "+err.Error(),
-		)
+		return nil, mapRequestError(meta, err, http.StatusInternalServerError, "request error")
 	}
 
 	return resp, nil
@@ -314,14 +327,25 @@ func handleResponse(
 	meta *meta.Meta,
 	store adaptor.Store,
 	resp *http.Response,
-	detail *RequestDetail,
-) (model.Usage, adaptor.Error) {
-	buf := getBuffer()
-	defer putBuffer(buf)
+	detail *BodyDetail,
+	opt BodyDetailOption,
+) (adaptor.DoResponseResult, adaptor.Error) {
+	var (
+		buf       *bytes.Buffer
+		bodyLimit int
+	)
+
+	bodyLimit = responseBodyCaptureLimit(opt)
+
+	if bodyLimit > 0 {
+		buf = getBuffer()
+		defer putBuffer(buf)
+	}
 
 	rw := &responseWriter{
 		ResponseWriter: c.Writer,
 		body:           buf,
+		bodyLimit:      bodyLimit,
 	}
 
 	rawWriter := c.Writer
@@ -332,22 +356,124 @@ func handleResponse(
 
 	c.Writer = rw
 
-	usage, relayErr := a.DoResponse(meta, store, c, resp)
-	if relayErr != nil {
+	result, relayErr := a.DoResponse(meta, store, c, resp)
+	if relayErr != nil && opt.IncludeResponseBody && opt.MaxResponseBodySize >= 0 {
 		respBody, _ := relayErr.MarshalJSON()
-		detail.ResponseBody = conv.BytesToString(respBody)
-	} else {
-		// copy body buffer
-		// do not use bytes conv
-		detail.ResponseBody = rw.body.String()
+		detail.ResponseBody = responseBodyDetail(respBody, opt.MaxResponseBodySize)
+	} else if rw.body != nil {
+		detail.ResponseBody = capturedResponseBodyDetail(rw.body.Bytes(), opt.MaxResponseBodySize)
 	}
 
-	return usage, relayErr
+	if result.UpstreamID == "" && resp != nil && resp.Header != nil &&
+		resp.Header.Get("x-request-id") != "" {
+		result.UpstreamID = resp.Header.Get("x-request-id")
+	}
+
+	return result, relayErr
 }
 
-func updateUsageMetrics(usage model.Usage, log *log.Entry) {
+func mergeBodyDetailOptions(opts ...BodyDetailOption) BodyDetailOption {
+	if len(opts) == 0 {
+		return BodyDetailOption{}
+	}
+
+	return opts[0]
+}
+
+func requestBodyDetail(c *gin.Context, opt BodyDetailOption) (string, error) {
+	if !opt.IncludeRequestBody ||
+		opt.MaxRequestBodySize < 0 ||
+		c == nil ||
+		c.Request == nil ||
+		!common.IsJSONContentType(c.GetHeader("Content-Type")) {
+		return "", nil
+	}
+
+	body, err := common.GetRequestBodyReusable(c.Request)
+	if err != nil {
+		return "", err
+	}
+
+	return bodyDetailFromBytes(body, opt.MaxRequestBodySize), nil
+}
+
+func bodyDetailFromBytes(body []byte, maxSize int64) string {
+	if !utf8.Valid(body) {
+		return ""
+	}
+
+	return limitBodyDetailString(string(limitBodyDetailBytes(body, maxSize)))
+}
+
+func responseBodyDetail(body []byte, maxSize int64) string {
+	return bodyDetailFromBytes(body, maxSize)
+}
+
+func capturedResponseBodyDetail(body []byte, maxSize int64) string {
+	if maxSize == 0 || int64(len(body)) <= maxSize {
+		if !utf8.Valid(body) {
+			return ""
+		}
+
+		return conv.BytesToString(body)
+	}
+
+	return limitBodyDetailString(conv.BytesToString(limitBodyDetailBytes(body, maxSize)))
+}
+
+func limitBodyDetailString(body string) string {
+	for len(body) > 0 && !utf8.ValidString(body) {
+		body = body[:len(body)-1]
+	}
+
+	return body
+}
+
+func limitBodyDetailBytes(body []byte, maxSize int64) []byte {
+	if maxSize == 0 || int64(len(body)) <= maxSize {
+		return body
+	}
+
+	return body[:min(len(body), int(maxSize)+1)]
+}
+
+func responseBodyCaptureLimit(opt BodyDetailOption) int {
+	if !opt.IncludeResponseBody || opt.MaxResponseBodySize < 0 {
+		return 0
+	}
+
+	if opt.MaxResponseBodySize == 0 {
+		return maxBufferSize
+	}
+
+	if opt.MaxResponseBodySize >= int64(maxBufferSize) {
+		return maxBufferSize
+	}
+
+	return int(opt.MaxResponseBodySize + 1)
+}
+
+func updateUsageMetrics(result adaptor.DoResponseResult, log *log.Entry) {
+	usage := result.Usage
 	if usage.TotalTokens == 0 {
 		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
+	}
+
+	usageContext := result.UsageContext
+	if usageContext.Resolution != "" {
+		log.Data["resolution"] = usageContext.Resolution
+	}
+
+	if usageContext.NativeResolution != "" {
+		log.Data["native_resolution"] = usageContext.NativeResolution
+	}
+
+	if usageContext.Quality != "" {
+		log.Data["quality"] = usageContext.Quality
+	}
+
+	if usageContext.ServiceTier != "" {
+		log.Data["service_tier"] = usageContext.ServiceTier
 	}
 
 	if usage.InputTokens > 0 {
@@ -362,12 +488,20 @@ func updateUsageMetrics(usage model.Usage, log *log.Entry) {
 		log.Data["t_audio_input"] = usage.AudioInputTokens
 	}
 
+	if usage.VideoInputTokens > 0 {
+		log.Data["t_video_input"] = usage.VideoInputTokens
+	}
+
 	if usage.OutputTokens > 0 {
 		log.Data["t_output"] = usage.OutputTokens
 	}
 
 	if usage.ImageOutputTokens > 0 {
 		log.Data["t_image_output"] = usage.ImageOutputTokens
+	}
+
+	if usage.AudioOutputTokens > 0 {
+		log.Data["t_audio_output"] = usage.AudioOutputTokens
 	}
 
 	if usage.TotalTokens > 0 {
@@ -388,5 +522,9 @@ func updateUsageMetrics(usage model.Usage, log *log.Entry) {
 
 	if usage.WebSearchCount > 0 {
 		log.Data["t_websearch"] = usage.WebSearchCount
+	}
+
+	if result.AsyncUsage {
+		log.Data["async_usage"] = true
 	}
 }

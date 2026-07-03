@@ -4,8 +4,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/bytedance/sonic"
-	"github.com/bytedance/sonic/ast"
 	"github.com/labring/aiproxy/core/common"
 	"github.com/labring/aiproxy/core/relay/adaptor"
 	"github.com/labring/aiproxy/core/relay/meta"
@@ -35,20 +33,27 @@ func (t *Timeout) ConvertRequest(
 	case mode.Embeddings:
 		meta.RequestTimeout = time.Second * 30
 	case mode.Moderations:
-		meta.RequestTimeout = time.Minute * 3
+		meta.RequestTimeout = time.Minute * 5
 	case mode.ImagesGenerations,
 		mode.ImagesEdits:
-		meta.RequestTimeout = time.Minute * 5
+		meta.RequestTimeout = time.Minute * 10
 	case mode.AudioTranscription,
 		mode.AudioTranslation:
-		meta.RequestTimeout = time.Minute * 3
+		meta.RequestTimeout = time.Minute * 5
 	case mode.Rerank:
-		meta.RequestTimeout = time.Second * 30
+		meta.RequestTimeout = time.Minute * 3
 	case mode.ParsePdf:
 		meta.RequestTimeout = time.Minute * 3
 	case mode.VideoGenerationsJobs,
 		mode.VideoGenerationsGetJobs,
-		mode.VideoGenerationsContent:
+		mode.VideoGenerationsContent,
+		mode.Videos,
+		mode.VideosGet,
+		mode.VideosContent,
+		mode.VideosDelete,
+		mode.VideosRemix,
+		mode.VideosEdits,
+		mode.VideosExtensions:
 		meta.RequestTimeout = time.Second * 30
 	case mode.ResponsesGet,
 		mode.ResponsesDelete,
@@ -92,12 +97,12 @@ func (t *Timeout) ConvertRequest(
 		}
 	}
 
+	if timeout := meta.ModelConfig.RequestTimeout(); timeout != 0 {
+		meta.RequestTimeout = timeout
+	}
+
 	if stream {
 		if timeout := meta.ModelConfig.StreamRequestTimeout(); timeout != 0 {
-			meta.RequestTimeout = timeout
-		}
-	} else {
-		if timeout := meta.ModelConfig.RequestTimeout(); timeout != 0 {
 			meta.RequestTimeout = timeout
 		}
 	}
@@ -116,7 +121,7 @@ func isStream(req *http.Request) (bool, error) {
 		return false, nil
 	}
 
-	node, err := sonic.GetWithOptions(body, ast.SearchOptions{}, "stream")
+	node, err := common.GetJSONNodeNoCopy(body, "stream")
 	if err != nil {
 		return false, err
 	}

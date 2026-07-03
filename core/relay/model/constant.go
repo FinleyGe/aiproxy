@@ -3,6 +3,7 @@ package model
 // Common Role constants (used across different API formats)
 const (
 	RoleSystem    = "system"
+	RoleDeveloper = "developer"
 	RoleUser      = "user"
 	RoleAssistant = "assistant"
 	RoleTool      = "tool"
@@ -12,6 +13,7 @@ const (
 	ContentTypeText       = "text"
 	ContentTypeImageURL   = "image_url"
 	ContentTypeInputAudio = "input_audio"
+	ContentTypeVideoURL   = "video_url"
 )
 
 const (
@@ -19,6 +21,7 @@ const (
 	ChatCompletionObject      = "chat.completion"
 	VideoGenerationJobObject  = "video.generation.job"
 	VideoGenerationObject     = "video.generation"
+	VideoObject               = "video"
 )
 
 type FinishReason = string

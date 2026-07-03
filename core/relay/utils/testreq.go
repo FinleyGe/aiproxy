@@ -53,7 +53,7 @@ func BuildRequest(modelConfig model.ModelConfig) (io.Reader, mode.Mode, error) {
 		}
 
 		return body, mode.Moderations, nil
-	case mode.ImagesGenerations:
+	case mode.ImagesGenerations, mode.GeminiImage:
 		body, err := BuildImagesGenerationsRequest(modelConfig)
 		if err != nil {
 			return nil, mode.Unknown, err
@@ -62,7 +62,7 @@ func BuildRequest(modelConfig model.ModelConfig) (io.Reader, mode.Mode, error) {
 		return body, mode.ImagesGenerations, nil
 	case mode.ImagesEdits:
 		return nil, mode.Unknown, NewErrUnsupportedModelType("edits")
-	case mode.AudioSpeech:
+	case mode.AudioSpeech, mode.GeminiTTS:
 		body, err := BuildAudioSpeechRequest(modelConfig.Model)
 		if err != nil {
 			return nil, mode.Unknown, err
@@ -80,8 +80,43 @@ func BuildRequest(modelConfig model.ModelConfig) (io.Reader, mode.Mode, error) {
 		}
 
 		return body, mode.Rerank, nil
+	case mode.VideoGenerationsJobs:
+		body, err := BuildVideoGenerationJobRequest(modelConfig.Model)
+		if err != nil {
+			return nil, mode.Unknown, err
+		}
+
+		return body, mode.VideoGenerationsJobs, nil
+	case mode.Videos:
+		body, err := BuildVideosRequest(modelConfig.Model)
+		if err != nil {
+			return nil, mode.Unknown, err
+		}
+
+		return body, mode.Videos, nil
 	case mode.ParsePdf:
 		return nil, mode.Unknown, NewErrUnsupportedModelType("parse pdf")
+	case mode.GeminiVideo:
+		body, err := BuildGeminiVideoRequest(modelConfig.Model)
+		if err != nil {
+			return nil, mode.Unknown, err
+		}
+
+		return body, mode.GeminiVideo, nil
+	case mode.AliVideo:
+		body, err := BuildAliVideoRequest(modelConfig.Model)
+		if err != nil {
+			return nil, mode.Unknown, err
+		}
+
+		return body, mode.AliVideo, nil
+	case mode.DoubaoVideo:
+		body, err := BuildDoubaoVideoRequest(modelConfig.Model)
+		if err != nil {
+			return nil, mode.Unknown, err
+		}
+
+		return body, mode.DoubaoVideo, nil
 	default:
 		return nil, mode.Unknown, NewErrUnsupportedModelType(modelConfig.Type.String())
 	}
@@ -151,12 +186,8 @@ func BuildModerationsRequest(model string) (io.Reader, error) {
 func BuildImagesGenerationsRequest(modelConfig model.ModelConfig) (io.Reader, error) {
 	imagesGenerationsRequest := &relaymodel.GeneralOpenAIRequest{
 		Model:  modelConfig.Model,
-		Prompt: "hi",
+		Prompt: "A simple red square icon on a white background.",
 		Size:   "1024x1024",
-	}
-	for size := range modelConfig.ImagePrices {
-		imagesGenerationsRequest.Size = size
-		break
 	}
 
 	jsonBytes, err := sonic.Marshal(imagesGenerationsRequest)
@@ -189,6 +220,93 @@ func BuildRerankRequest(model string) (io.Reader, error) {
 	}
 
 	jsonBytes, err := sonic.Marshal(rerankRequest)
+	if err != nil {
+		return nil, err
+	}
+
+	return bytes.NewReader(jsonBytes), nil
+}
+
+func BuildVideoGenerationJobRequest(model string) (io.Reader, error) {
+	testRequest := map[string]any{
+		"model":  model,
+		"prompt": "A calm cinematic shot of clouds moving over a mountain.",
+	}
+
+	jsonBytes, err := sonic.Marshal(testRequest)
+	if err != nil {
+		return nil, err
+	}
+
+	return bytes.NewReader(jsonBytes), nil
+}
+
+func BuildVideosRequest(model string) (io.Reader, error) {
+	testRequest := &relaymodel.VideosRequest{
+		Model:  model,
+		Prompt: "A calm cinematic shot of clouds moving over a mountain.",
+	}
+
+	jsonBytes, err := sonic.Marshal(testRequest)
+	if err != nil {
+		return nil, err
+	}
+
+	return bytes.NewReader(jsonBytes), nil
+}
+
+func BuildGeminiVideoRequest(_ string) (io.Reader, error) {
+	testRequest := map[string]any{
+		"instances": []map[string]any{
+			{
+				"prompt": "A calm cinematic shot of clouds moving over a mountain.",
+			},
+		},
+	}
+
+	jsonBytes, err := sonic.Marshal(testRequest)
+	if err != nil {
+		return nil, err
+	}
+
+	return bytes.NewReader(jsonBytes), nil
+}
+
+func BuildAliVideoRequest(model string) (io.Reader, error) {
+	testRequest := map[string]any{
+		"model": model,
+		"input": map[string]any{
+			"prompt": "A calm cinematic shot of clouds moving over a mountain.",
+		},
+		"parameters": map[string]any{
+			"duration": 5,
+			"size":     "720P",
+		},
+	}
+
+	jsonBytes, err := sonic.Marshal(testRequest)
+	if err != nil {
+		return nil, err
+	}
+
+	return bytes.NewReader(jsonBytes), nil
+}
+
+func BuildDoubaoVideoRequest(model string) (io.Reader, error) {
+	testRequest := map[string]any{
+		"model": model,
+		"content": []map[string]any{
+			{
+				"type": "text",
+				"text": "A calm cinematic shot of clouds moving over a mountain.",
+			},
+		},
+		"duration":   5,
+		"resolution": "720p",
+		"ratio":      "16:9",
+	}
+
+	jsonBytes, err := sonic.Marshal(testRequest)
 	if err != nil {
 		return nil, err
 	}

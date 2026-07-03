@@ -2,6 +2,7 @@ package gemini_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -9,10 +10,12 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/labring/aiproxy/core/model"
 	"github.com/labring/aiproxy/core/relay/adaptor/gemini"
 	"github.com/labring/aiproxy/core/relay/meta"
 	relaymodel "github.com/labring/aiproxy/core/relay/model"
 	"github.com/smartystreets/goconvey/convey"
+	"github.com/stretchr/testify/require"
 )
 
 func TestClaudeHandler(t *testing.T) {
@@ -50,7 +53,12 @@ func TestClaudeHandler(t *testing.T) {
 
 			w := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(w)
-			c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+			c.Request, _ = http.NewRequestWithContext(
+				context.Background(),
+				http.MethodPost,
+				"/",
+				nil,
+			)
 
 			usage, handlerErr := gemini.ClaudeHandler(meta, c, httpResp)
 			convey.So(handlerErr, convey.ShouldBeNil)
@@ -105,7 +113,12 @@ func TestClaudeHandler(t *testing.T) {
 
 			w := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(w)
-			c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+			c.Request, _ = http.NewRequestWithContext(
+				context.Background(),
+				http.MethodPost,
+				"/",
+				nil,
+			)
 
 			usage, handlerErr := gemini.ClaudeHandler(meta, c, httpResp)
 			convey.So(handlerErr, convey.ShouldBeNil)
@@ -164,7 +177,12 @@ func TestClaudeStreamHandler(t *testing.T) {
 
 			w := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(w)
-			c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+			c.Request, _ = http.NewRequestWithContext(
+				context.Background(),
+				http.MethodPost,
+				"/",
+				nil,
+			)
 
 			_, err := gemini.ClaudeStreamHandler(meta, c, httpResp)
 			convey.So(err, convey.ShouldBeNil)
@@ -179,4 +197,58 @@ func TestClaudeStreamHandler(t *testing.T) {
 			)
 		})
 	})
+}
+
+func TestConvertClaudeRequest_DisableAutoImageURLToBase64(t *testing.T) {
+	channel := &model.Channel{
+		Configs: model.ChannelConfigs{
+			"disable_auto_image_url_to_base64": true,
+		},
+	}
+	meta := meta.NewMeta(channel, 0, "gemini-1.5-pro", model.ModelConfig{})
+
+	reqBody := relaymodel.ClaudeAnyContentRequest{
+		Model: "gemini-1.5-pro",
+		Messages: []relaymodel.ClaudeAnyContentMessage{
+			{
+				Role: relaymodel.RoleUser,
+				Content: []relaymodel.ClaudeContent{
+					{
+						Type: relaymodel.ClaudeContentTypeImage,
+						Source: &relaymodel.ClaudeImageSource{
+							Type: relaymodel.ClaudeImageSourceTypeURL,
+							URL:  "https://example.com/test.png",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	data, err := json.Marshal(reqBody)
+	require.NoError(t, err)
+	req, _ := http.NewRequestWithContext(
+		t.Context(),
+		http.MethodPost,
+		"/v1/messages",
+		bytes.NewReader(data),
+	)
+
+	result, err := gemini.ConvertClaudeRequest(meta, req)
+	require.NoError(t, err)
+
+	body, _ := io.ReadAll(result.Body)
+
+	var geminiReq relaymodel.GeminiChatRequest
+	require.NoError(t, json.Unmarshal(body, &geminiReq))
+	require.Len(t, geminiReq.Contents, 1)
+	require.Len(t, geminiReq.Contents[0].Parts, 1)
+	require.Nil(t, geminiReq.Contents[0].Parts[0].InlineData)
+	require.NotNil(t, geminiReq.Contents[0].Parts[0].FileData)
+	require.Equal(
+		t,
+		"https://example.com/test.png",
+		geminiReq.Contents[0].Parts[0].FileData.FileURI,
+	)
+	require.Equal(t, "", geminiReq.Contents[0].Parts[0].FileData.MimeType)
 }

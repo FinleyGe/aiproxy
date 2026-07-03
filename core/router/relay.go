@@ -14,21 +14,71 @@ func SetRelayRouter(router *gin.Engine) {
 	v1betaRouter := router.Group("/v1beta")
 	v1betaRouter.Use(middleware.IPBlock, middleware.TokenAuth)
 
+	aliRouter := router.Group("/api/v1")
+	aliRouter.Use(middleware.IPBlock, middleware.TokenAuth)
+
+	doubaoRouter := router.Group("/api/v3")
+	doubaoRouter.Use(middleware.IPBlock, middleware.TokenAuth)
+
 	modelsRouter := v1Router.Group("/models")
 	{
 		modelsRouter.GET("", controller.ListModels)
 		modelsRouter.GET("/:model", controller.RetrieveModel)
 	}
 
+	// provider-native video APIs
+	{
+		aliRouter.POST(
+			"/services/aigc/video-generation/video-synthesis",
+			controller.AliVideo()...,
+		)
+		aliRouter.GET(
+			"/tasks/:task_id",
+			controller.AliVideoTask()...,
+		)
+		doubaoRouter.POST(
+			"/contents/generations/tasks",
+			controller.DoubaoVideo()...,
+		)
+		doubaoRouter.GET(
+			"/contents/generations/tasks/:task_id",
+			controller.DoubaoVideoTask()...,
+		)
+		doubaoRouter.DELETE(
+			"/contents/generations/tasks/:task_id",
+			controller.DeleteDoubaoVideoTask()...,
+		)
+	}
+
 	// gemini
 	{
 		v1Router.POST(
 			"/models/*model",
-			controller.Gemini()...,
+			controller.GeminiByPath()...,
+		)
+		v1Router.GET(
+			"/operations/*operation_id",
+			controller.GeminiOperation()...,
+		)
+		v1Router.GET(
+			"/models/:model/operations/*operation_id",
+			controller.GeminiOperation()...,
 		)
 		v1betaRouter.POST(
 			"/models/*model",
-			controller.Gemini()...,
+			controller.GeminiByPath()...,
+		)
+		v1betaRouter.GET(
+			"/operations/*operation_id",
+			controller.GeminiOperation()...,
+		)
+		v1betaRouter.GET(
+			"/models/:model/operations/*operation_id",
+			controller.GeminiOperation()...,
+		)
+		v1betaRouter.GET(
+			"/files/*model",
+			controller.GeminiByPath()...,
 		)
 	}
 
@@ -104,6 +154,34 @@ func SetRelayRouter(router *gin.Engine) {
 		relayRouter.GET(
 			"/video/generations/:id/content/video",
 			controller.VideoGenerationsContent()...,
+		)
+		relayRouter.POST(
+			"/videos",
+			controller.Videos()...,
+		)
+		relayRouter.POST(
+			"/videos/edits",
+			controller.EditVideo()...,
+		)
+		relayRouter.POST(
+			"/videos/extensions",
+			controller.ExtendVideo()...,
+		)
+		relayRouter.GET(
+			"/videos/:video_id",
+			controller.GetVideo()...,
+		)
+		relayRouter.GET(
+			"/videos/:video_id/content",
+			controller.GetVideoContent()...,
+		)
+		relayRouter.DELETE(
+			"/videos/:video_id",
+			controller.DeleteVideo()...,
+		)
+		relayRouter.POST(
+			"/videos/:video_id/remix",
+			controller.RemixVideo()...,
 		)
 		relayRouter.POST("/responses",
 			controller.CreateResponse()...)

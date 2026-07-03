@@ -14,6 +14,7 @@ import (
 	"github.com/labring/aiproxy/core/common/config"
 	"github.com/labring/aiproxy/core/common/conv"
 	"github.com/labring/aiproxy/core/common/notify"
+	"github.com/labring/aiproxy/core/common/oncall"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -102,7 +103,8 @@ func initOptionMap() error {
 
 	optionMap["GroupConsumeLevelRatio"] = conv.BytesToString(groupConsumeLevelRatioJSON)
 	optionMap["NotifyNote"] = config.GetNotifyNote()
-	optionMap["DefaultMCPHost"] = config.GetDefaultMCPHost()
+	optionMap["DefaultHost"] = config.GetDefaultHost()
+	optionMap["DefaultMCPHost"] = config.GetConfiguredDefaultMCPHost()
 	optionMap["PublicMCPHost"] = config.GetPublicMCPHost()
 	optionMap["GroupMCPHost"] = config.GetGroupMCPHost()
 	optionMap["DefaultWarnNotifyErrorRate"] = strconv.FormatFloat(
@@ -210,6 +212,9 @@ func SyncOptions(ctx context.Context, wg *sync.WaitGroup, frequency time.Duratio
 					"failed to sync options",
 					err.Error(),
 				)
+				oncall.AlertDBError("SyncOptions", err)
+			} else {
+				oncall.ClearDBError("SyncOptions")
 			}
 		}
 	}
@@ -425,6 +430,8 @@ func updateOption(key, value string, isInit bool) (err error) {
 		config.SetGroupConsumeLevelRatio(newGroupRpmRatioMap)
 	case "NotifyNote":
 		config.SetNotifyNote(value)
+	case "DefaultHost":
+		config.SetDefaultHost(value)
 	case "DefaultMCPHost":
 		config.SetDefaultMCPHost(value)
 	case "PublicMCPHost":

@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/bytedance/sonic"
+	"github.com/bytedance/sonic/ast"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -75,7 +77,7 @@ func ConvertTTSRequest(meta *meta.Meta, req *http.Request) (adaptor.ConvertResul
 
 	meta.Set("stream_format", request.StreamFormat)
 
-	reqMap, err := utils.UnmarshalMap(req)
+	node, err := common.UnmarshalRequest2NodeReusable(req)
 	if err != nil {
 		return adaptor.ConvertResult{}, err
 	}
@@ -125,13 +127,11 @@ func ConvertTTSRequest(meta *meta.Meta, req *http.Request) (adaptor.ConvertResul
 
 	doubaoRequest.Audio.Encoding = request.ResponseFormat
 
-	volumeRatio, ok := reqMap["volume_ratio"].(float64)
-	if ok {
+	if volumeRatio, ok := floatFromTTSNode(node.Get("volume_ratio")); ok {
 		doubaoRequest.Audio.VolumeRatio = volumeRatio
 	}
 
-	pitchRatio, ok := reqMap["pitch_ratio"].(float64)
-	if ok {
+	if pitchRatio, ok := floatFromTTSNode(node.Get("pitch_ratio")); ok {
 		doubaoRequest.Audio.PitchRatio = pitchRatio
 	}
 
@@ -147,7 +147,7 @@ func ConvertTTSRequest(meta *meta.Meta, req *http.Request) (adaptor.ConvertResul
 
 	payloadArr := make([]byte, 4)
 	binary.BigEndian.PutUint32(payloadArr, uint32(len(compressedData)))
-	clientRequest := make([]byte, len(defaultHeader))
+	clientRequest := make([]byte, len(defaultHeader), len(defaultHeader)+4+len(compressedData))
 	copy(clientRequest, defaultHeader)
 	clientRequest = append(clientRequest, payloadArr...)
 	clientRequest = append(clientRequest, compressedData...)
@@ -155,6 +155,33 @@ func ConvertTTSRequest(meta *meta.Meta, req *http.Request) (adaptor.ConvertResul
 	return adaptor.ConvertResult{
 		Body: bytes.NewReader(clientRequest),
 	}, nil
+}
+
+func floatFromTTSNode(node *ast.Node) (float64, bool) {
+	if node == nil || !node.Exists() || node.TypeSafe() == ast.V_NULL {
+		return 0, false
+	}
+
+	if node.TypeSafe() == ast.V_STRING {
+		value, err := node.String()
+		if err != nil {
+			return 0, false
+		}
+
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+		if err != nil {
+			return 0, false
+		}
+
+		return parsed, true
+	}
+
+	value, err := node.Float64()
+	if err != nil {
+		return 0, false
+	}
+
+	return value, true
 }
 
 func TTSDoRequest(meta *meta.Meta, req *http.Request) (*http.Response, error) {
@@ -189,7 +216,7 @@ func TTSDoResponse(
 	meta *meta.Meta,
 	c *gin.Context,
 	_ *http.Response,
-) (model.Usage, adaptor.Error) {
+) (adaptor.DoResponseResult, adaptor.Error) {
 	log := common.GetLogger(c)
 
 	conn, ok := meta.MustGet("ws_conn").(*websocket.Conn)
@@ -208,7 +235,7 @@ func TTSDoResponse(
 	for {
 		_, message, err := conn.ReadMessage()
 		if err != nil {
-			return usage, relaymodel.WrapperOpenAIError(
+			return adaptor.DoResponseResult{Usage: usage}, relaymodel.WrapperOpenAIError(
 				err,
 				"doubao_wss_read_msg_failed",
 				http.StatusInternalServerError,
@@ -217,7 +244,7 @@ func TTSDoResponse(
 
 		resp, err := parseResponse(message)
 		if err != nil {
-			return usage, relaymodel.WrapperOpenAIError(
+			return adaptor.DoResponseResult{Usage: usage}, relaymodel.WrapperOpenAIError(
 				err,
 				"doubao_tts_parse_response_failed",
 				http.StatusInternalServerError,
@@ -246,7 +273,7 @@ func TTSDoResponse(
 		})
 	}
 
-	return usage, nil
+	return adaptor.DoResponseResult{Usage: usage}, nil
 }
 
 func gzipCompress(input []byte) ([]byte, error) {

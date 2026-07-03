@@ -1,6 +1,8 @@
 package model
 
 import (
+	"strings"
+
 	"github.com/labring/aiproxy/core/model"
 	"github.com/labring/aiproxy/core/relay/adaptor"
 )
@@ -24,6 +26,7 @@ type GeminiChatContent struct {
 
 type GeminiPart struct {
 	InlineData       *GeminiInlineData       `json:"inlineData,omitempty"`
+	FileData         *GeminiFileData         `json:"fileData,omitempty"`
 	FunctionCall     *GeminiFunctionCall     `json:"functionCall,omitempty"`
 	FunctionResponse *GeminiFunctionResponse `json:"functionResponse,omitempty"`
 	Text             string                  `json:"text,omitempty"`
@@ -34,6 +37,11 @@ type GeminiPart struct {
 type GeminiInlineData struct {
 	MimeType string `json:"mimeType"`
 	Data     string `json:"data"`
+}
+
+type GeminiFileData struct {
+	MimeType string `json:"mimeType,omitempty"`
+	FileURI  string `json:"fileUri"`
 }
 
 type GeminiFunctionCall struct {
@@ -69,6 +77,7 @@ type GeminiChatGenerationConfig struct {
 	ResponseModalities []string              `json:"responseModalities,omitempty"`
 	ThinkingConfig     *GeminiThinkingConfig `json:"thinkingConfig,omitempty"`
 	ImageConfig        *GeminiImageConfig    `json:"imageConfig,omitempty"`
+	SpeechConfig       *GeminiSpeechConfig   `json:"speechConfig,omitempty"`
 }
 
 type GeminiImageConfig struct {
@@ -76,9 +85,22 @@ type GeminiImageConfig struct {
 	ImageSize   string `json:"imageSize,omitempty"`
 }
 
+type GeminiSpeechConfig struct {
+	VoiceConfig *GeminiVoiceConfig `json:"voiceConfig,omitempty"`
+}
+
+type GeminiVoiceConfig struct {
+	PrebuiltVoiceConfig *GeminiPrebuiltVoiceConfig `json:"prebuiltVoiceConfig,omitempty"`
+}
+
+type GeminiPrebuiltVoiceConfig struct {
+	VoiceName string `json:"voiceName,omitempty"`
+}
+
 type GeminiThinkingConfig struct {
-	ThinkingBudget  int  `json:"thinkingBudget,omitempty"`
-	IncludeThoughts bool `json:"includeThoughts,omitempty"`
+	ThinkingBudget  *int   `json:"thinkingBudget,omitempty"`
+	IncludeThoughts bool   `json:"includeThoughts,omitempty"`
+	ThinkingLevel   string `json:"thinkingLevel,omitempty"`
 }
 
 type GeminiFunctionCallingConfig struct {
@@ -97,16 +119,54 @@ type GeminiChatResponse struct {
 	ModelVersion   string                    `json:"modelVersion,omitempty"`
 }
 
-// GetWebSearchCount returns the total number of web search queries from all candidates
+// GetWebSearchCount returns billable Google Search grounding usage.
 func (r *GeminiChatResponse) GetWebSearchCount() int64 {
-	var count int64
+	if r.IsGemini3Model() {
+		return int64(len(r.WebSearchQuerySet()))
+	}
+
 	for _, candidate := range r.Candidates {
-		if candidate.GroundingMetadata != nil {
-			count += int64(len(candidate.GroundingMetadata.WebSearchQueries))
+		if candidate.GroundingMetadata != nil &&
+			len(candidate.GroundingMetadata.WebSearchQueries) > 0 {
+			return 1
 		}
 	}
 
-	return count
+	return 0
+}
+
+func (r *GeminiChatResponse) IsGemini3Model() bool {
+	if r == nil {
+		return false
+	}
+
+	modelVersion := strings.ToLower(strings.TrimSpace(r.ModelVersion))
+
+	return strings.HasPrefix(modelVersion, "gemini-3")
+}
+
+func (r *GeminiChatResponse) WebSearchQuerySet() map[string]struct{} {
+	queries := map[string]struct{}{}
+	if r == nil {
+		return queries
+	}
+
+	for _, candidate := range r.Candidates {
+		if candidate == nil || candidate.GroundingMetadata == nil {
+			continue
+		}
+
+		for _, query := range candidate.GroundingMetadata.WebSearchQueries {
+			query = strings.TrimSpace(query)
+			if query == "" {
+				continue
+			}
+
+			queries[query] = struct{}{}
+		}
+	}
+
+	return queries
 }
 
 type GeminiUsageMetadata struct {
@@ -179,6 +239,39 @@ func (u *GeminiUsageMetadata) GetImageOutputTokens() int64 {
 	return 0
 }
 
+// GetAudioInputTokens returns the number of audio input tokens from PromptTokensDetails.
+func (u *GeminiUsageMetadata) GetAudioInputTokens() int64 {
+	for _, detail := range u.PromptTokensDetails {
+		if detail.Modality == GeminiModalityAudio {
+			return detail.TokenCount
+		}
+	}
+
+	return 0
+}
+
+// GetVideoInputTokens returns the number of video input tokens from PromptTokensDetails.
+func (u *GeminiUsageMetadata) GetVideoInputTokens() int64 {
+	for _, detail := range u.PromptTokensDetails {
+		if detail.Modality == GeminiModalityVideo {
+			return detail.TokenCount
+		}
+	}
+
+	return 0
+}
+
+// GetAudioOutputTokens returns the number of audio output tokens from CandidatesTokensDetails.
+func (u *GeminiUsageMetadata) GetAudioOutputTokens() int64 {
+	for _, detail := range u.CandidatesTokensDetails {
+		if detail.Modality == GeminiModalityAudio {
+			return detail.TokenCount
+		}
+	}
+
+	return 0
+}
+
 // ToUsage converts GeminiUsageMetadata to ChatUsage format
 func (u *GeminiUsageMetadata) ToUsage() ChatUsage {
 	chatUsage := ChatUsage{
@@ -187,9 +280,13 @@ func (u *GeminiUsageMetadata) ToUsage() ChatUsage {
 			u.ThoughtsTokenCount,
 		TotalTokens: u.TotalTokenCount,
 		PromptTokensDetails: &PromptTokensDetails{
+			AudioTokens:  u.GetAudioInputTokens(),
 			CachedTokens: u.CachedContentTokenCount,
+			ImageTokens:  u.GetImageInputTokens(),
+			VideoTokens:  u.GetVideoInputTokens(),
 		},
 		CompletionTokensDetails: &CompletionTokensDetails{
+			AudioTokens:     u.GetAudioOutputTokens(),
 			ReasoningTokens: u.ThoughtsTokenCount,
 			ImageTokens:     u.GetImageOutputTokens(),
 		},
@@ -206,8 +303,11 @@ func (u *GeminiUsageMetadata) ToModelUsage() model.Usage {
 	usage := model.Usage{
 		InputTokens:       model.ZeroNullInt64(inputTokens),
 		ImageInputTokens:  model.ZeroNullInt64(u.GetImageInputTokens()),
+		AudioInputTokens:  model.ZeroNullInt64(u.GetAudioInputTokens()),
+		VideoInputTokens:  model.ZeroNullInt64(u.GetVideoInputTokens()),
 		OutputTokens:      model.ZeroNullInt64(u.CandidatesTokenCount + u.ThoughtsTokenCount),
 		ImageOutputTokens: model.ZeroNullInt64(u.GetImageOutputTokens()),
+		AudioOutputTokens: model.ZeroNullInt64(u.GetAudioOutputTokens()),
 		CachedTokens:      model.ZeroNullInt64(u.CachedContentTokenCount),
 		ReasoningTokens:   model.ZeroNullInt64(u.ThoughtsTokenCount),
 		TotalTokens:       model.ZeroNullInt64(u.TotalTokenCount),
@@ -224,14 +324,29 @@ func (u *GeminiUsageMetadata) ToResponseUsage() ResponseUsage {
 		TotalTokens:  u.TotalTokenCount,
 	}
 
-	if u.CachedContentTokenCount > 0 {
+	audioInputTokens := u.GetAudioInputTokens()
+	imageInputTokens := u.GetImageInputTokens()
+
+	videoInputTokens := u.GetVideoInputTokens()
+	if u.CachedContentTokenCount > 0 ||
+		audioInputTokens > 0 ||
+		imageInputTokens > 0 ||
+		videoInputTokens > 0 {
 		usage.InputTokensDetails = &ResponseUsageDetails{
+			AudioTokens:  audioInputTokens,
 			CachedTokens: u.CachedContentTokenCount,
+			ImageTokens:  imageInputTokens,
+			VideoTokens:  videoInputTokens,
 		}
 	}
 
-	if u.ThoughtsTokenCount > 0 {
+	audioOutputTokens := u.GetAudioOutputTokens()
+
+	imageOutputTokens := u.GetImageOutputTokens()
+	if u.ThoughtsTokenCount > 0 || audioOutputTokens > 0 || imageOutputTokens > 0 {
 		usage.OutputTokensDetails = &ResponseUsageDetails{
+			AudioTokens:     audioOutputTokens,
+			ImageTokens:     imageOutputTokens,
 			ReasoningTokens: u.ThoughtsTokenCount,
 		}
 	}
@@ -266,6 +381,18 @@ type GeminiErrorResponse struct {
 func NewGeminiError(statusCode int, err GeminiError) adaptor.Error {
 	return adaptor.NewError(statusCode, GeminiErrorResponse{
 		Error: err,
+	})
+}
+
+func WrapperGeminiError(err error, statusCode int) adaptor.Error {
+	return WrapperGeminiErrorWithMessage(err.Error(), statusCode)
+}
+
+func WrapperGeminiErrorWithMessage(message string, statusCode int) adaptor.Error {
+	return NewGeminiError(statusCode, GeminiError{
+		Message: message,
+		Status:  ErrorTypeAIPROXY,
+		Code:    statusCode,
 	})
 }
 

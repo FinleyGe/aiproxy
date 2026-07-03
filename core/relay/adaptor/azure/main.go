@@ -7,8 +7,10 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/labring/aiproxy/core/model"
 	"github.com/labring/aiproxy/core/relay/adaptor"
 	"github.com/labring/aiproxy/core/relay/adaptor/openai"
+	"github.com/labring/aiproxy/core/relay/adaptor/registry"
 	"github.com/labring/aiproxy/core/relay/meta"
 	"github.com/labring/aiproxy/core/relay/mode"
 )
@@ -17,6 +19,10 @@ import (
 
 type Adaptor struct {
 	openai.Adaptor
+}
+
+func init() {
+	registry.Register(model.ChannelTypeAzure, &Adaptor{})
 }
 
 func (a *Adaptor) DefaultBaseURL() string {
@@ -29,6 +35,46 @@ func (a *Adaptor) GetRequestURL(
 	_ *gin.Context,
 ) (adaptor.RequestURL, error) {
 	return GetRequestURL(meta, true)
+}
+
+func (a *Adaptor) ConvertRequest(
+	meta *meta.Meta,
+	store adaptor.Store,
+	req *http.Request,
+) (adaptor.ConvertResult, error) {
+	return ConvertRequest(meta, store, req, true)
+}
+
+func ConvertRequest(
+	meta *meta.Meta,
+	store adaptor.Store,
+	req *http.Request,
+	replaceDot bool,
+) (adaptor.ConvertResult, error) {
+	model := meta.ActualModel
+
+	newmodel := model
+	if replaceDot {
+		newmodel = strings.ReplaceAll(model, ".", "")
+	}
+
+	meta.ActualModel = newmodel
+	defer func() {
+		meta.ActualModel = model
+	}()
+
+	switch meta.Mode {
+	case mode.ImagesGenerations:
+		return openai.ConvertImagesRequest(
+			meta,
+			req,
+			openai.ImagesRequestRemoveModel,
+		)
+	case mode.ImagesEdits:
+		return openai.ConvertImagesEditsRequest(meta, req, false)
+	}
+
+	return openai.ConvertRequest(meta, store, req)
 }
 
 //nolint:gocyclo
@@ -110,7 +156,7 @@ func GetRequestURL(meta *meta.Meta, replaceDot bool) (adaptor.RequestURL, error)
 		}, nil
 	case mode.ChatCompletions, mode.Anthropic, mode.Gemini:
 		// Check if model requires Responses API
-		if openai.IsResponsesOnlyModel(&meta.ModelConfig, meta.ActualModel) {
+		if openai.IsResponsesOnlyModelAny(&meta.ModelConfig, meta.OriginModel, meta.ActualModel) {
 			// Azure Responses API format
 			url, err := url.JoinPath(
 				meta.Channel.BaseURL,
@@ -195,7 +241,7 @@ func GetRequestURL(meta *meta.Meta, replaceDot bool) (adaptor.RequestURL, error)
 		}
 
 		return adaptor.RequestURL{
-			Method: http.MethodPost,
+			Method: http.MethodGet,
 			URL:    fmt.Sprintf("%s?api-version=%s", url, apiVersion),
 		}, nil
 	case mode.VideoGenerationsContent:
@@ -203,15 +249,85 @@ func GetRequestURL(meta *meta.Meta, replaceDot bool) (adaptor.RequestURL, error)
 			meta.Channel.BaseURL,
 			"/openai/v1/video/generations",
 			meta.GenerationID,
-			"/content/video",
+			"content/video",
 		)
 		if err != nil {
 			return adaptor.RequestURL{}, err
 		}
 
 		return adaptor.RequestURL{
-			Method: http.MethodPost,
+			Method: http.MethodGet,
 			URL:    fmt.Sprintf("%s?api-version=%s", url, apiVersion),
+		}, nil
+	case mode.Videos:
+		url, err := url.JoinPath(meta.Channel.BaseURL, "/openai/v1/videos")
+		if err != nil {
+			return adaptor.RequestURL{}, err
+		}
+
+		return adaptor.RequestURL{
+			Method: http.MethodPost,
+			URL:    fmt.Sprintf("%s?api-version=%s", url, "preview"),
+		}, nil
+	case mode.VideosGet:
+		url, err := url.JoinPath(meta.Channel.BaseURL, "/openai/v1/videos", meta.VideoID)
+		if err != nil {
+			return adaptor.RequestURL{}, err
+		}
+
+		return adaptor.RequestURL{
+			Method: http.MethodGet,
+			URL:    fmt.Sprintf("%s?api-version=%s", url, "preview"),
+		}, nil
+	case mode.VideosContent:
+		url, err := url.JoinPath(meta.Channel.BaseURL, "/openai/v1/videos", meta.VideoID, "content")
+		if err != nil {
+			return adaptor.RequestURL{}, err
+		}
+
+		return adaptor.RequestURL{
+			Method: http.MethodGet,
+			URL:    fmt.Sprintf("%s?api-version=%s", url, "preview"),
+		}, nil
+	case mode.VideosDelete:
+		url, err := url.JoinPath(meta.Channel.BaseURL, "/openai/v1/videos", meta.VideoID)
+		if err != nil {
+			return adaptor.RequestURL{}, err
+		}
+
+		return adaptor.RequestURL{
+			Method: http.MethodDelete,
+			URL:    fmt.Sprintf("%s?api-version=%s", url, "preview"),
+		}, nil
+	case mode.VideosRemix:
+		url, err := url.JoinPath(meta.Channel.BaseURL, "/openai/v1/videos", meta.VideoID, "remix")
+		if err != nil {
+			return adaptor.RequestURL{}, err
+		}
+
+		return adaptor.RequestURL{
+			Method: http.MethodPost,
+			URL:    fmt.Sprintf("%s?api-version=%s", url, "preview"),
+		}, nil
+	case mode.VideosEdits:
+		url, err := url.JoinPath(meta.Channel.BaseURL, "/openai/v1/videos/edits")
+		if err != nil {
+			return adaptor.RequestURL{}, err
+		}
+
+		return adaptor.RequestURL{
+			Method: http.MethodPost,
+			URL:    fmt.Sprintf("%s?api-version=%s", url, "preview"),
+		}, nil
+	case mode.VideosExtensions:
+		url, err := url.JoinPath(meta.Channel.BaseURL, "/openai/v1/videos/extensions")
+		if err != nil {
+			return adaptor.RequestURL{}, err
+		}
+
+		return adaptor.RequestURL{
+			Method: http.MethodPost,
+			URL:    fmt.Sprintf("%s?api-version=%s", url, "preview"),
 		}, nil
 
 	// Add support for Responses API endpoints
@@ -320,7 +436,7 @@ func (a *Adaptor) SetupRequestHeader(
 func (a *Adaptor) Metadata() adaptor.Metadata {
 	return adaptor.Metadata{
 		Readme: fmt.Sprintf(
-			"Model names do not contain '.' character, dots will be removed\nFor example: gpt-3.5-turbo becomes gpt-35-turbo\nAPI version is optional, default is '%s'\nGemini support",
+			"Azure OpenAI endpoint\nModel names do not contain '.' character, dots will be removed\nFor example: gpt-3.5-turbo becomes gpt-35-turbo\nAPI version is optional, default is '%s'\nSupports Gemini-compatible request conversion",
 			DefaultAPIVersion,
 		),
 		KeyHelp: "key or key|api-version",

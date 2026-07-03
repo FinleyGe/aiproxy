@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"strings"
+
 	"github.com/gin-gonic/gin"
 	"github.com/labring/aiproxy/core/middleware"
 	"github.com/labring/aiproxy/core/relay/mode"
@@ -308,6 +310,129 @@ func VideoGenerationsJobs() []gin.HandlerFunc {
 	}
 }
 
+// AliVideo godoc
+//
+//	@Summary		Create Ali native video task
+//	@Description	Create an Ali DashScope native video generation task.
+//	@Tags			relay
+//	@Accept			json
+//	@Produce		json
+//	@Security		ApiKeyAuth
+//	@Param			request			body		object	true	"Ali DashScope video synthesis request"
+//	@Param			Aiproxy-Channel	header		string	false	"Optional Aiproxy-Channel header"
+//	@Success		200				{object}	object
+//	@Header			all				{integer}	X-RateLimit-Limit-Requests		"X-RateLimit-Limit-Requests"
+//	@Header			all				{integer}	X-RateLimit-Limit-Tokens		"X-RateLimit-Limit-Tokens"
+//	@Header			all				{integer}	X-RateLimit-Remaining-Requests	"X-RateLimit-Remaining-Requests"
+//	@Header			all				{integer}	X-RateLimit-Remaining-Tokens	"X-RateLimit-Remaining-Tokens"
+//	@Header			all				{string}	X-RateLimit-Reset-Requests		"X-RateLimit-Reset-Requests"
+//	@Header			all				{string}	X-RateLimit-Reset-Tokens		"X-RateLimit-Reset-Tokens"
+//	@Router			/api/v1/services/aigc/video-generation/video-synthesis [post]
+func AliVideo() []gin.HandlerFunc {
+	return []gin.HandlerFunc{
+		middleware.NewDistribute(mode.AliVideo),
+		NewRelay(mode.AliVideo),
+	}
+}
+
+// AliVideoTask godoc
+//
+//	@Summary		Get Ali native video task
+//	@Description	Get an Ali DashScope native video generation task.
+//	@Tags			relay
+//	@Produce		json
+//	@Security		ApiKeyAuth
+//	@Param			task_id			path		string	true	"Task ID"
+//	@Param			Aiproxy-Channel	header		string	false	"Optional Aiproxy-Channel header"
+//	@Success		200				{object}	object
+//	@Header			all				{integer}	X-RateLimit-Limit-Requests		"X-RateLimit-Limit-Requests"
+//	@Header			all				{integer}	X-RateLimit-Limit-Tokens		"X-RateLimit-Limit-Tokens"
+//	@Header			all				{integer}	X-RateLimit-Remaining-Requests	"X-RateLimit-Remaining-Requests"
+//	@Header			all				{integer}	X-RateLimit-Remaining-Tokens	"X-RateLimit-Remaining-Tokens"
+//	@Header			all				{string}	X-RateLimit-Reset-Requests		"X-RateLimit-Reset-Requests"
+//	@Header			all				{string}	X-RateLimit-Reset-Tokens		"X-RateLimit-Reset-Tokens"
+//	@Router			/api/v1/tasks/{task_id} [get]
+func AliVideoTask() []gin.HandlerFunc {
+	return []gin.HandlerFunc{
+		middleware.NewDistribute(mode.AliVideoTasks),
+		NewRelay(mode.AliVideoTasks),
+	}
+}
+
+// DoubaoVideo godoc
+//
+//	@Summary		Create Doubao native video task
+//	@Description	Create a Doubao native video generation task.
+//	@Tags			relay
+//	@Accept			json
+//	@Produce		json
+//	@Security		ApiKeyAuth
+//	@Param			request			body		object	true	"Doubao video generation task request"
+//	@Param			Aiproxy-Channel	header		string	false	"Optional Aiproxy-Channel header"
+//	@Success		200				{object}	object
+//	@Header			all				{integer}	X-RateLimit-Limit-Requests		"X-RateLimit-Limit-Requests"
+//	@Header			all				{integer}	X-RateLimit-Limit-Tokens		"X-RateLimit-Limit-Tokens"
+//	@Header			all				{integer}	X-RateLimit-Remaining-Requests	"X-RateLimit-Remaining-Requests"
+//	@Header			all				{integer}	X-RateLimit-Remaining-Tokens	"X-RateLimit-Remaining-Tokens"
+//	@Header			all				{string}	X-RateLimit-Reset-Requests		"X-RateLimit-Reset-Requests"
+//	@Header			all				{string}	X-RateLimit-Reset-Tokens		"X-RateLimit-Reset-Tokens"
+//	@Router			/api/v3/contents/generations/tasks [post]
+func DoubaoVideo() []gin.HandlerFunc {
+	return []gin.HandlerFunc{
+		middleware.NewDistribute(mode.DoubaoVideo),
+		NewRelay(mode.DoubaoVideo),
+	}
+}
+
+// DoubaoVideoTask godoc
+//
+//	@Summary		Get Doubao native video task
+//	@Description	Get a Doubao native video generation task.
+//	@Tags			relay
+//	@Produce		json
+//	@Security		ApiKeyAuth
+//	@Param			task_id			path		string	true	"Task ID"
+//	@Param			Aiproxy-Channel	header		string	false	"Optional Aiproxy-Channel header"
+//	@Success		200				{object}	object
+//	@Header			all				{integer}	X-RateLimit-Limit-Requests		"X-RateLimit-Limit-Requests"
+//	@Header			all				{integer}	X-RateLimit-Limit-Tokens		"X-RateLimit-Limit-Tokens"
+//	@Header			all				{integer}	X-RateLimit-Remaining-Requests	"X-RateLimit-Remaining-Requests"
+//	@Header			all				{integer}	X-RateLimit-Remaining-Tokens	"X-RateLimit-Remaining-Tokens"
+//	@Header			all				{string}	X-RateLimit-Reset-Requests		"X-RateLimit-Reset-Requests"
+//	@Header			all				{string}	X-RateLimit-Reset-Tokens		"X-RateLimit-Reset-Tokens"
+//	@Router			/api/v3/contents/generations/tasks/{task_id} [get]
+func DoubaoVideoTask() []gin.HandlerFunc {
+	return []gin.HandlerFunc{
+		middleware.NewDistribute(mode.DoubaoVideoTasks),
+		NewRelay(mode.DoubaoVideoTasks),
+	}
+}
+
+// DeleteDoubaoVideoTask godoc
+//
+//	@Summary		Delete Doubao native video task
+//	@Description	Delete a Doubao native video generation task.
+//	@Tags			relay
+//	@Produce		json
+//	@Security		ApiKeyAuth
+//	@Param			task_id			path		string	true	"Task ID"
+//	@Param			Aiproxy-Channel	header		string	false	"Optional Aiproxy-Channel header"
+//	@Success		200				{object}	object
+//	@Success		204				{object}	nil
+//	@Header			all				{integer}	X-RateLimit-Limit-Requests		"X-RateLimit-Limit-Requests"
+//	@Header			all				{integer}	X-RateLimit-Limit-Tokens		"X-RateLimit-Limit-Tokens"
+//	@Header			all				{integer}	X-RateLimit-Remaining-Requests	"X-RateLimit-Remaining-Requests"
+//	@Header			all				{integer}	X-RateLimit-Remaining-Tokens	"X-RateLimit-Remaining-Tokens"
+//	@Header			all				{string}	X-RateLimit-Reset-Requests		"X-RateLimit-Reset-Requests"
+//	@Header			all				{string}	X-RateLimit-Reset-Tokens		"X-RateLimit-Reset-Tokens"
+//	@Router			/api/v3/contents/generations/tasks/{task_id} [delete]
+func DeleteDoubaoVideoTask() []gin.HandlerFunc {
+	return []gin.HandlerFunc{
+		middleware.NewDistribute(mode.DoubaoVideoTasksDelete),
+		NewRelay(mode.DoubaoVideoTasksDelete),
+	}
+}
+
 // VideoGenerationsGetJobs godoc
 //
 //	@Summary		VideoGenerationsGetJobs
@@ -353,6 +478,139 @@ func VideoGenerationsContent() []gin.HandlerFunc {
 	return []gin.HandlerFunc{
 		middleware.NewDistribute(mode.VideoGenerationsContent),
 		NewRelay(mode.VideoGenerationsContent),
+	}
+}
+
+// Videos godoc
+//
+//	@Summary		Create video
+//	@Description	Create a video generation job
+//	@Tags			relay
+//	@Produce		json
+//	@Security		ApiKeyAuth
+//	@Param			request			body		model.VideosRequest	true	"Request"
+//	@Param			Aiproxy-Channel	header		string				false	"Optional Aiproxy-Channel header"
+//	@Success		200				{object}	model.Video
+//	@Header			all				{integer}	X-RateLimit-Limit-Requests		"X-RateLimit-Limit-Requests"
+//	@Header			all				{integer}	X-RateLimit-Limit-Tokens		"X-RateLimit-Limit-Tokens"
+//	@Header			all				{integer}	X-RateLimit-Remaining-Requests	"X-RateLimit-Remaining-Requests"
+//	@Header			all				{integer}	X-RateLimit-Remaining-Tokens	"X-RateLimit-Remaining-Tokens"
+//	@Header			all				{string}	X-RateLimit-Reset-Requests		"X-RateLimit-Reset-Requests"
+//	@Header			all				{string}	X-RateLimit-Reset-Tokens		"X-RateLimit-Reset-Tokens"
+//	@Router			/v1/videos [post]
+func Videos() []gin.HandlerFunc {
+	return []gin.HandlerFunc{
+		middleware.NewDistribute(mode.Videos),
+		NewRelay(mode.Videos),
+	}
+}
+
+// EditVideo godoc
+//
+//	@Summary		Edit video
+//	@Description	Create a new video by editing a source video
+//	@Tags			relay
+//	@Produce		json
+//	@Security		ApiKeyAuth
+//	@Param			request			body		model.VideosEditRequest	true	"Request"
+//	@Param			Aiproxy-Channel	header		string					false	"Optional Aiproxy-Channel header"
+//	@Success		200				{object}	model.Video
+//	@Router			/v1/videos/edits [post]
+func EditVideo() []gin.HandlerFunc {
+	return []gin.HandlerFunc{
+		middleware.NewDistribute(mode.VideosEdits),
+		NewRelay(mode.VideosEdits),
+	}
+}
+
+// ExtendVideo godoc
+//
+//	@Summary		Extend video
+//	@Description	Create an extension of a completed video
+//	@Tags			relay
+//	@Produce		json
+//	@Security		ApiKeyAuth
+//	@Param			request			body		model.VideosExtensionRequest	true	"Request"
+//	@Param			Aiproxy-Channel	header		string							false	"Optional Aiproxy-Channel header"
+//	@Success		200				{object}	model.Video
+//	@Router			/v1/videos/extensions [post]
+func ExtendVideo() []gin.HandlerFunc {
+	return []gin.HandlerFunc{
+		middleware.NewDistribute(mode.VideosExtensions),
+		NewRelay(mode.VideosExtensions),
+	}
+}
+
+// GetVideo godoc
+//
+//	@Summary		Get video
+//	@Description	Get a video by ID
+//	@Tags			relay
+//	@Produce		json
+//	@Security		ApiKeyAuth
+//	@Param			video_id		path		string	true	"Video ID"
+//	@Param			Aiproxy-Channel	header		string	false	"Optional Aiproxy-Channel header"
+//	@Success		200				{object}	model.Video
+//	@Router			/v1/videos/{video_id} [get]
+func GetVideo() []gin.HandlerFunc {
+	return []gin.HandlerFunc{
+		middleware.NewDistribute(mode.VideosGet),
+		NewRelay(mode.VideosGet),
+	}
+}
+
+// GetVideoContent godoc
+//
+//	@Summary		Get video content
+//	@Description	Get generated video binary content
+//	@Tags			relay
+//	@Produce		application/octet-stream
+//	@Security		ApiKeyAuth
+//	@Param			video_id		path	string	true	"Video ID"
+//	@Param			Aiproxy-Channel	header	string	false	"Optional Aiproxy-Channel header"
+//	@Success		200				{file}	file	"video binary"
+//	@Router			/v1/videos/{video_id}/content [get]
+func GetVideoContent() []gin.HandlerFunc {
+	return []gin.HandlerFunc{
+		middleware.NewDistribute(mode.VideosContent),
+		NewRelay(mode.VideosContent),
+	}
+}
+
+// DeleteVideo godoc
+//
+//	@Summary		Delete video
+//	@Description	Delete a video by ID
+//	@Tags			relay
+//	@Produce		json
+//	@Security		ApiKeyAuth
+//	@Param			video_id		path	string	true	"Video ID"
+//	@Param			Aiproxy-Channel	header	string	false	"Optional Aiproxy-Channel header"
+//	@Success		204
+//	@Router			/v1/videos/{video_id} [delete]
+func DeleteVideo() []gin.HandlerFunc {
+	return []gin.HandlerFunc{
+		middleware.NewDistribute(mode.VideosDelete),
+		NewRelay(mode.VideosDelete),
+	}
+}
+
+// RemixVideo godoc
+//
+//	@Summary		Remix video
+//	@Description	Create a new video from an existing video
+//	@Tags			relay
+//	@Produce		json
+//	@Security		ApiKeyAuth
+//	@Param			video_id		path		string						true	"Video ID"
+//	@Param			request			body		model.VideosRemixRequest	true	"Request"
+//	@Param			Aiproxy-Channel	header		string						false	"Optional Aiproxy-Channel header"
+//	@Success		200				{object}	model.Video
+//	@Router			/v1/videos/{video_id}/remix [post]
+func RemixVideo() []gin.HandlerFunc {
+	return []gin.HandlerFunc{
+		middleware.NewDistribute(mode.VideosRemix),
+		NewRelay(mode.VideosRemix),
 	}
 }
 
@@ -471,10 +729,70 @@ func GetResponseInputItems() []gin.HandlerFunc {
 //	@Header			all				{string}	X-RateLimit-Reset-Requests		"X-RateLimit-Reset-Requests"
 //	@Header			all				{string}	X-RateLimit-Reset-Tokens		"X-RateLimit-Reset-Tokens"
 //	@Router			/{version}/models/{model} [post]
-
-func Gemini() []gin.HandlerFunc {
+func GeminiByPath() []gin.HandlerFunc {
 	return []gin.HandlerFunc{
-		middleware.NewDistribute(mode.Gemini),
-		NewRelay(mode.Gemini),
+		func(c *gin.Context) {
+			relayMode := mode.Gemini
+			modelPath := c.Param("model")
+			action := geminiPathAction(modelPath)
+
+			switch {
+			case geminiPathIsFile(modelPath):
+				relayMode = mode.GeminiFiles
+			case action == "predictLongRunning":
+				relayMode = mode.GeminiVideo
+			}
+
+			middleware.NewDistribute(relayMode)(c)
+
+			if c.IsAborted() {
+				return
+			}
+
+			NewRelay(relayMode)(c)
+		},
 	}
+}
+
+// GeminiOperation godoc
+//
+//	@Summary		Gemini Operation API
+//	@Description	Get a Gemini long-running operation, including Gemini video generation operations.
+//	@Tags			relay
+//	@Produce		json
+//	@Security		ApiKeyAuth
+//	@Param			version			path		string	true	"API Version (v1 or v1beta)"
+//	@Param			operation_id	path		string	true	"Operation ID"
+//	@Param			Aiproxy-Channel	header		string	false	"Optional Aiproxy-Channel header"
+//	@Success		200				{object}	object
+//	@Header			all				{integer}	X-RateLimit-Limit-Requests		"X-RateLimit-Limit-Requests"
+//	@Header			all				{integer}	X-RateLimit-Limit-Tokens		"X-RateLimit-Limit-Tokens"
+//	@Header			all				{integer}	X-RateLimit-Remaining-Requests	"X-RateLimit-Remaining-Requests"
+//	@Header			all				{integer}	X-RateLimit-Remaining-Tokens	"X-RateLimit-Remaining-Tokens"
+//	@Header			all				{string}	X-RateLimit-Reset-Requests		"X-RateLimit-Reset-Requests"
+//	@Header			all				{string}	X-RateLimit-Reset-Tokens		"X-RateLimit-Reset-Tokens"
+//	@Router			/{version}/operations/{operation_id} [get]
+func GeminiOperation() []gin.HandlerFunc {
+	return []gin.HandlerFunc{
+		middleware.NewDistribute(mode.GeminiVideoOperations),
+		NewRelay(mode.GeminiVideoOperations),
+	}
+}
+
+func geminiPathAction(modelPath string) string {
+	modelPath = strings.TrimPrefix(modelPath, "/")
+
+	_, action, ok := strings.Cut(modelPath, ":")
+	if !ok {
+		return ""
+	}
+
+	return action
+}
+
+func geminiPathIsFile(modelPath string) bool {
+	modelPath = strings.TrimPrefix(modelPath, "/")
+	fileID, ok := strings.CutSuffix(modelPath, ":download")
+
+	return ok && fileID != "" && !strings.Contains(fileID, "/")
 }

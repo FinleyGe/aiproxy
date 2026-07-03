@@ -2,9 +2,9 @@ package plugin
 
 import (
 	"net/http"
+	"slices"
 
 	"github.com/gin-gonic/gin"
-	"github.com/labring/aiproxy/core/model"
 	"github.com/labring/aiproxy/core/relay/adaptor"
 	"github.com/labring/aiproxy/core/relay/meta"
 )
@@ -47,7 +47,7 @@ type Plugin interface {
 		c *gin.Context,
 		resp *http.Response,
 		do adaptor.DoResponse,
-	) (model.Usage, adaptor.Error)
+	) (adaptor.DoResponseResult, adaptor.Error)
 }
 
 func WrapperAdaptor(adaptor adaptor.Adaptor, plugins ...Plugin) adaptor.Adaptor {
@@ -56,10 +56,10 @@ func WrapperAdaptor(adaptor adaptor.Adaptor, plugins ...Plugin) adaptor.Adaptor 
 	}
 
 	result := adaptor
-	for i := len(plugins) - 1; i >= 0; i-- {
+	for _, v := range slices.Backward(plugins) {
 		result = &wrappedAdaptor{
 			Adaptor: result,
-			plugin:  plugins[i],
+			plugin:  v,
 		}
 	}
 
@@ -112,6 +112,6 @@ func (w *wrappedAdaptor) DoResponse(
 	store adaptor.Store,
 	c *gin.Context,
 	resp *http.Response,
-) (model.Usage, adaptor.Error) {
+) (adaptor.DoResponseResult, adaptor.Error) {
 	return w.plugin.DoResponse(meta, store, c, resp, w.Adaptor)
 }

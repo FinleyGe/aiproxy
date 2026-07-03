@@ -1,20 +1,28 @@
 package consume_test
 
 import (
+	"context"
 	"net/http"
 	"testing"
+	"time"
 
+	"github.com/glebarez/sqlite"
 	"github.com/labring/aiproxy/core/common/consume"
 	"github.com/labring/aiproxy/core/model"
+	"github.com/labring/aiproxy/core/relay/meta"
+	"github.com/labring/aiproxy/core/relay/mode"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func TestCalculateAmount(t *testing.T) {
 	tests := []struct {
-		name  string
-		code  int
-		usage model.Usage
-		price model.Price
-		want  float64
+		name        string
+		code        int
+		usage       model.Usage
+		price       model.Price
+		serviceTier string
+		want        float64
 	}{
 		{
 			name: "Per-Request Pricing (OK)",
@@ -97,6 +105,42 @@ func TestCalculateAmount(t *testing.T) {
 				ImageOutputPrice: 0.01,
 			},
 			want: 0.019, // 0.001 * 1000/1000 + 0.004 * (3000-1000)/1000 + 0.01 * 1000/1000
+		},
+		{
+			name: "Audio Input and Output Pricing",
+			code: http.StatusOK,
+			usage: model.Usage{
+				InputTokens:       2000,
+				AudioInputTokens:  500,
+				OutputTokens:      3000,
+				AudioOutputTokens: 1000,
+			},
+			price: model.Price{
+				InputPrice:       0.001,
+				AudioInputPrice:  0.003,
+				OutputPrice:      0.004,
+				AudioOutputPrice: 0.01,
+			},
+			want: 0.021, // text in 0.0015 + audio in 0.0015 + text out 0.008 + audio out 0.01
+		},
+		{
+			name: "Video Input Pricing",
+			code: http.StatusOK,
+			usage: model.Usage{
+				InputTokens:      3000,
+				ImageInputTokens: 500,
+				AudioInputTokens: 600,
+				VideoInputTokens: 1000,
+				OutputTokens:     2000,
+			},
+			price: model.Price{
+				InputPrice:      0.001,
+				ImageInputPrice: 0.003,
+				AudioInputPrice: 0.004,
+				VideoInputPrice: 0.008,
+				OutputPrice:     0.002,
+			},
+			want: 0.0168, // text in 0.0009 + image in 0.0015 + audio in 0.0024 + video in 0.008 + text out 0.004
 		},
 		{
 			name: "Cached Token Pricing",
@@ -241,7 +285,12 @@ func TestCalculateAmount(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		got := consume.CalculateAmount(tt.code, tt.usage, tt.price)
+		got := consume.CalculateAmount(
+			tt.code,
+			tt.usage,
+			model.UsageContext{ServiceTier: tt.serviceTier},
+			tt.price,
+		)
 		if got != tt.want {
 			t.Errorf("CalculateAmount()\n%s\n\tgot: %v\n\twant: %v\n\t", tt.name, got, tt.want)
 		}
@@ -250,11 +299,12 @@ func TestCalculateAmount(t *testing.T) {
 
 func TestCalculateAmountWithConditionalPricing(t *testing.T) {
 	tests := []struct {
-		name  string
-		code  int
-		usage model.Usage
-		price model.Price
-		want  float64
+		name        string
+		code        int
+		usage       model.Usage
+		price       model.Price
+		serviceTier string
+		want        float64
 	}{
 		{
 			name: "Conditional Pricing - Small Input/Output",
@@ -452,12 +502,183 @@ func TestCalculateAmountWithConditionalPricing(t *testing.T) {
 			},
 			want: 0.002, // 0.001 * 1000/1000 + 0.002 * 500/1000
 		},
+		{
+			name: "Conditional Prices - Service Tier Priority",
+			code: http.StatusOK,
+			usage: model.Usage{
+				InputTokens:  1000,
+				OutputTokens: 500,
+			},
+			serviceTier: "priority",
+			price: model.Price{
+				InputPrice:  0.001,
+				OutputPrice: 0.002,
+				ConditionalPrices: []model.ConditionalPrice{
+					{
+						Condition: model.PriceCondition{
+							ServiceTier: "priority",
+						},
+						Price: model.Price{
+							InputPrice:  0.003,
+							OutputPrice: 0.006,
+						},
+					},
+				},
+			},
+			want: 0.006, // 0.003 * 1000/1000 + 0.006 * 500/1000
+		},
+		{
+			name: "Conditional Prices - More Specific Service Tier Wins",
+			code: http.StatusOK,
+			usage: model.Usage{
+				InputTokens:  1000,
+				OutputTokens: 500,
+			},
+			serviceTier: "priority",
+			price: model.Price{
+				InputPrice:  0.001,
+				OutputPrice: 0.002,
+				ConditionalPrices: []model.ConditionalPrice{
+					{
+						Condition: model.PriceCondition{
+							InputTokenMax: 32000,
+						},
+						Price: model.Price{
+							InputPrice:  0.001,
+							OutputPrice: 0.002,
+						},
+					},
+					{
+						Condition: model.PriceCondition{
+							InputTokenMax: 32000,
+							ServiceTier:   "priority",
+						},
+						Price: model.Price{
+							InputPrice:  0.003,
+							OutputPrice: 0.006,
+						},
+					},
+				},
+			},
+			want: 0.006, // 0.003 * 1000/1000 + 0.006 * 500/1000
+		},
+		{
+			name: "Conditional Prices - Service Tier Priority Before Wildcard",
+			code: http.StatusOK,
+			usage: model.Usage{
+				InputTokens:  1000,
+				OutputTokens: 500,
+			},
+			serviceTier: "priority",
+			price: model.Price{
+				InputPrice:  0.001,
+				OutputPrice: 0.002,
+				ConditionalPrices: []model.ConditionalPrice{
+					{
+						Condition: model.PriceCondition{
+							InputTokenMax: 32000,
+							ServiceTier:   "priority",
+						},
+						Price: model.Price{
+							InputPrice:  0.003,
+							OutputPrice: 0.006,
+						},
+					},
+					{
+						Condition: model.PriceCondition{
+							InputTokenMax: 32000,
+						},
+						Price: model.Price{
+							InputPrice:  0.001,
+							OutputPrice: 0.002,
+						},
+					},
+				},
+			},
+			want: 0.006, // 0.003 * 1000/1000 + 0.006 * 500/1000
+		},
 	}
 
 	for _, tt := range tests {
-		got := consume.CalculateAmount(tt.code, tt.usage, tt.price)
+		got := consume.CalculateAmount(
+			tt.code,
+			tt.usage,
+			model.UsageContext{ServiceTier: tt.serviceTier},
+			tt.price,
+		)
 		if got != tt.want {
 			t.Errorf("CalculateAmount()\n%s\n\tgot: %v\n\twant: %v\n\t", tt.name, got, tt.want)
 		}
 	}
+}
+
+func TestConsumePendingAsyncUsageDoesNotRecordPriceUsageOrAmount(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.Log{}))
+
+	oldLogDB := model.LogDB
+	model.LogDB = db
+	t.Cleanup(func() {
+		model.LogDB = oldLogDB
+	})
+
+	requestMeta := &meta.Meta{
+		RequestID:   "async_pending",
+		RequestAt:   time.Now(),
+		Group:       model.GroupCache{ID: "group"},
+		Token:       model.TokenCache{ID: 1, Name: "token"},
+		Channel:     meta.ChannelMeta{ID: 2},
+		OriginModel: "video-model",
+		Mode:        mode.VideoGenerationsJobs,
+	}
+
+	price := model.Price{
+		OutputPrice:     0.1,
+		OutputPriceUnit: 1,
+		ConditionalPrices: []model.ConditionalPrice{
+			{
+				Condition: model.PriceCondition{Resolution: []string{"720p"}},
+				Price: model.Price{
+					OutputPrice:     0.4,
+					OutputPriceUnit: 1,
+				},
+			},
+		},
+	}
+	usage := model.Usage{
+		OutputTokens: 5,
+		TotalTokens:  5,
+	}
+	usageContext := model.UsageContext{
+		Resolution: "720p",
+	}
+
+	consume.Consume(
+		context.Background(),
+		time.Now(),
+		nil,
+		time.Now(),
+		http.StatusOK,
+		requestMeta,
+		usage,
+		usageContext,
+		price,
+		"",
+		"127.0.0.1",
+		0,
+		nil,
+		true,
+		nil,
+		"upstream-id",
+		model.AsyncUsageStatusPending,
+	)
+
+	var logEntry model.Log
+	require.NoError(t, db.Where("request_id = ?", requestMeta.RequestID).First(&logEntry).Error)
+	require.Equal(t, model.AsyncUsageStatusPending, logEntry.AsyncUsageStatus)
+	require.Equal(t, model.ZeroNullInt64(0), logEntry.Usage.OutputTokens)
+	require.Zero(t, logEntry.Amount.UsedAmount)
+	require.Zero(t, logEntry.Price.OutputPrice)
+	require.Empty(t, logEntry.Price.ConditionalPrices)
 }

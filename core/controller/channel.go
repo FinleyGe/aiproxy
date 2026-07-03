@@ -7,7 +7,9 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/bytedance/sonic"
 	"github.com/gin-gonic/gin"
 	"github.com/labring/aiproxy/core/controller/utils"
 	"github.com/labring/aiproxy/core/middleware"
@@ -28,6 +30,52 @@ import (
 //	@Router			/api/channels/type_metas [get]
 func ChannelTypeMetas(c *gin.Context) {
 	middleware.SuccessResponse(c, adaptors.ChannelMetas)
+}
+
+type ChannelResponse struct {
+	*model.Channel
+	AccessedAt time.Time `json:"accessed_at,omitempty"`
+}
+
+func (c *ChannelResponse) MarshalJSON() ([]byte, error) {
+	type Alias model.Channel
+
+	accessedAt := int64(0)
+	if !c.AccessedAt.IsZero() {
+		accessedAt = c.AccessedAt.UnixMilli()
+	}
+
+	return sonic.Marshal(&struct {
+		*Alias
+		CreatedAt        int64 `json:"created_at"`
+		BalanceUpdatedAt int64 `json:"balance_updated_at"`
+		LastTestErrorAt  int64 `json:"last_test_error_at"`
+		AccessedAt       int64 `json:"accessed_at,omitempty"`
+	}{
+		Alias:            (*Alias)(c.Channel),
+		CreatedAt:        c.CreatedAt.UnixMilli(),
+		BalanceUpdatedAt: c.BalanceUpdatedAt.UnixMilli(),
+		LastTestErrorAt:  c.LastTestErrorAt.UnixMilli(),
+		AccessedAt:       accessedAt,
+	})
+}
+
+func buildChannelResponse(channel *model.Channel) *ChannelResponse {
+	lastRequestAt, _ := model.GetChannelLastRequestTimeMinute(channel.ID)
+
+	return &ChannelResponse{
+		Channel:    channel,
+		AccessedAt: lastRequestAt,
+	}
+}
+
+func buildChannelResponses(channels []*model.Channel) []*ChannelResponse {
+	responses := make([]*ChannelResponse, len(channels))
+	for i, channel := range channels {
+		responses[i] = buildChannelResponse(channel)
+	}
+
+	return responses
 }
 
 // GetChannels godoc
@@ -72,7 +120,7 @@ func GetChannels(c *gin.Context) {
 	}
 
 	middleware.SuccessResponse(c, gin.H{
-		"channels": channels,
+		"channels": buildChannelResponses(channels),
 		"total":    total,
 	})
 }
@@ -93,7 +141,7 @@ func GetAllChannels(c *gin.Context) {
 		return
 	}
 
-	middleware.SuccessResponse(c, channels)
+	middleware.SuccessResponse(c, buildChannelResponses(channels))
 }
 
 // AddChannels godoc
@@ -181,7 +229,7 @@ func SearchChannels(c *gin.Context) {
 	}
 
 	middleware.SuccessResponse(c, gin.H{
-		"channels": channels,
+		"channels": buildChannelResponses(channels),
 		"total":    total,
 	})
 }
@@ -209,21 +257,27 @@ func GetChannel(c *gin.Context) {
 		return
 	}
 
-	middleware.SuccessResponse(c, channel)
+	middleware.SuccessResponse(c, buildChannelResponse(channel))
 }
 
 // AddChannelRequest represents the request body for adding a channel
 type AddChannelRequest struct {
-	ModelMapping map[string]string    `json:"model_mapping"`
-	Configs      model.ChannelConfigs `json:"configs"`
-	Name         string               `json:"name"`
-	Key          string               `json:"key"`
-	BaseURL      string               `json:"base_url"`
-	Models       []string             `json:"models"`
-	Type         model.ChannelType    `json:"type"`
-	Priority     int32                `json:"priority"`
-	Status       int                  `json:"status"`
-	Sets         []string             `json:"sets"`
+	ModelMapping            map[string]string    `json:"model_mapping"`
+	Configs                 model.ChannelConfigs `json:"configs"`
+	Name                    string               `json:"name"`
+	Key                     string               `json:"key"`
+	BaseURL                 string               `json:"base_url"`
+	ProxyURL                string               `json:"proxy_url"`
+	Models                  []string             `json:"models"`
+	Type                    model.ChannelType    `json:"type"`
+	Priority                int32                `json:"priority"`
+	Status                  int                  `json:"status"`
+	Sets                    []string             `json:"sets"`
+	EnabledAutoBalanceCheck bool                 `json:"enabled_auto_balance_check"`
+	SkipTLSVerify           bool                 `json:"skip_tls_verify"`
+	EnabledNoPermissionBan  bool                 `json:"enabled_no_permission_ban"`
+	WarnErrorRate           float64              `json:"warn_error_rate"`
+	MaxErrorRate            float64              `json:"max_error_rate"`
 }
 
 func (r *AddChannelRequest) ToChannel() (*model.Channel, error) {
@@ -258,25 +312,23 @@ func (r *AddChannelRequest) ToChannel() (*model.Channel, error) {
 		}
 	}
 
-	if r.Configs != nil {
-		if metadata.ConfigTemplates.Validator != nil {
-			if err := metadata.ConfigTemplates.Validator(r.Configs); err != nil {
-				return nil, fmt.Errorf("config validate faild: %w", err)
-			}
-		}
-	}
-
 	return &model.Channel{
-		Type:         r.Type,
-		Name:         r.Name,
-		Key:          r.Key,
-		BaseURL:      r.BaseURL,
-		Models:       slices.Clone(r.Models),
-		ModelMapping: maps.Clone(r.ModelMapping),
-		Priority:     r.Priority,
-		Status:       r.Status,
-		Configs:      r.Configs,
-		Sets:         slices.Clone(r.Sets),
+		Type:                    r.Type,
+		Name:                    r.Name,
+		Key:                     r.Key,
+		BaseURL:                 r.BaseURL,
+		ProxyURL:                r.ProxyURL,
+		Models:                  slices.Clone(r.Models),
+		ModelMapping:            maps.Clone(r.ModelMapping),
+		Priority:                r.Priority,
+		Status:                  r.Status,
+		Configs:                 r.Configs,
+		Sets:                    slices.Clone(r.Sets),
+		EnabledAutoBalanceCheck: r.EnabledAutoBalanceCheck,
+		SkipTLSVerify:           r.SkipTLSVerify,
+		EnabledNoPermissionBan:  r.EnabledNoPermissionBan,
+		WarnErrorRate:           r.WarnErrorRate,
+		MaxErrorRate:            r.MaxErrorRate,
 	}, nil
 }
 
@@ -394,6 +446,35 @@ func DeleteChannels(c *gin.Context) {
 	}
 
 	middleware.SuccessResponse(c, nil)
+}
+
+// GetChannelBatchInfo godoc
+//
+//	@Summary		Get basic info for multiple channels
+//	@Description	Returns id, name, and type for a batch of channel IDs
+//	@Tags			channels
+//	@Accept			json
+//	@Produce		json
+//	@Security		ApiKeyAuth
+//	@Param			ids	body		[]int	true	"Channel IDs"
+//	@Success		200	{object}	middleware.APIResponse{data=[]model.ChannelBasicInfo}
+//	@Router			/api/channels/batch_info [post]
+func GetChannelBatchInfo(c *gin.Context) {
+	ids := []int{}
+
+	err := c.ShouldBindJSON(&ids)
+	if err != nil {
+		middleware.ErrorResponse(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	channels, err := model.GetChannelsBasicInfoByIDs(ids)
+	if err != nil {
+		middleware.ErrorResponse(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	middleware.SuccessResponse(c, channels)
 }
 
 // UpdateChannel godoc

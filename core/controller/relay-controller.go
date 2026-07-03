@@ -6,12 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/rand/v2"
 	"net/http"
 	"strconv"
 	"time"
 
-	"github.com/bytedance/sonic"
 	"github.com/bytedance/sonic/ast"
 	"github.com/gin-gonic/gin"
 	"github.com/labring/aiproxy/core/common"
@@ -20,6 +20,7 @@ import (
 	"github.com/labring/aiproxy/core/common/conv"
 	"github.com/labring/aiproxy/core/middleware"
 	"github.com/labring/aiproxy/core/model"
+	"github.com/labring/aiproxy/core/monitor"
 	"github.com/labring/aiproxy/core/relay/adaptor"
 	"github.com/labring/aiproxy/core/relay/adaptors"
 	"github.com/labring/aiproxy/core/relay/controller"
@@ -28,29 +29,33 @@ import (
 	relaymodel "github.com/labring/aiproxy/core/relay/model"
 	"github.com/labring/aiproxy/core/relay/plugin"
 	"github.com/labring/aiproxy/core/relay/plugin/cache"
+	"github.com/labring/aiproxy/core/relay/plugin/cachefollow"
 	monitorplugin "github.com/labring/aiproxy/core/relay/plugin/monitor"
 	"github.com/labring/aiproxy/core/relay/plugin/patch"
 	"github.com/labring/aiproxy/core/relay/plugin/streamfake"
 	"github.com/labring/aiproxy/core/relay/plugin/thinksplit"
 	"github.com/labring/aiproxy/core/relay/plugin/timeout"
 	websearch "github.com/labring/aiproxy/core/relay/plugin/web-search"
+	log "github.com/sirupsen/logrus"
 )
 
 // https://platform.openai.com/docs/api-reference/chat
 
 type (
 	RelayHandler    func(*gin.Context, *meta.Meta) *controller.HandleResult
-	GetRequestUsage func(*gin.Context, model.ModelConfig) (model.Usage, error)
+	GetRequestUsage func(*gin.Context, model.ModelConfig) (controller.RequestUsage, error)
 	GetRequestPrice func(*gin.Context, model.ModelConfig) (model.Price, error)
+	ValidateRequest func(*gin.Context, model.ModelConfig) error
 )
 
 type RelayController struct {
 	GetRequestUsage GetRequestUsage
 	GetRequestPrice GetRequestPrice
+	ValidateRequest ValidateRequest
 	Handler         RelayHandler
 }
 
-var adaptorStore adaptor.Store = &storeImpl{}
+var AdaptorStore adaptor.Store = &storeImpl{}
 
 type storeImpl struct{}
 
@@ -66,17 +71,48 @@ func (s *storeImpl) GetStore(group string, tokenID int, id string) (adaptor.Stor
 		TokenID:   store.TokenID,
 		ChannelID: store.ChannelID,
 		Model:     store.Model,
+		Metadata:  store.Metadata,
+		CreatedAt: store.CreatedAt,
+		UpdatedAt: store.UpdatedAt,
 		ExpiresAt: store.ExpiresAt,
 	}, nil
 }
 
 func (s *storeImpl) SaveStore(store adaptor.StoreCache) error {
-	_, err := model.SaveStore(&model.StoreV2{
+	return s.SaveStoreWithOption(store, adaptor.SaveStoreOption{})
+}
+
+func (s *storeImpl) SaveStoreWithOption(
+	store adaptor.StoreCache,
+	opt adaptor.SaveStoreOption,
+) error {
+	_, err := model.SaveStoreWithOption(&model.StoreV2{
 		ID:        store.ID,
 		GroupID:   store.GroupID,
 		TokenID:   store.TokenID,
 		ChannelID: store.ChannelID,
 		Model:     store.Model,
+		Metadata:  store.Metadata,
+		CreatedAt: store.CreatedAt,
+		UpdatedAt: store.UpdatedAt,
+		ExpiresAt: store.ExpiresAt,
+	}, model.SaveStoreOption{
+		MinUpdateInterval: opt.MinUpdateInterval,
+	})
+
+	return err
+}
+
+func (s *storeImpl) SaveIfNotExistStore(store adaptor.StoreCache) error {
+	_, err := model.SaveIfNotExistStore(&model.StoreV2{
+		ID:        store.ID,
+		GroupID:   store.GroupID,
+		TokenID:   store.TokenID,
+		ChannelID: store.ChannelID,
+		Model:     store.Model,
+		Metadata:  store.Metadata,
+		CreatedAt: store.CreatedAt,
+		UpdatedAt: store.UpdatedAt,
 		ExpiresAt: store.ExpiresAt,
 	})
 
@@ -87,6 +123,7 @@ func wrapPlugin(ctx context.Context, mc *model.ModelCaches, a adaptor.Adaptor) a
 	return plugin.WrapperAdaptor(a,
 		monitorplugin.NewGroupMonitorPlugin(),
 		cache.NewCachePlugin(common.RDB),
+		cachefollow.NewCacheFollowPlugin(),
 		streamfake.NewStreamFakePlugin(),
 		timeout.NewTimeoutPlugin(),
 		websearch.NewWebSearchPlugin(func(modelName string) (*model.Channel, error) {
@@ -115,7 +152,7 @@ func relayHandler(c *gin.Context, meta *meta.Meta, mc *model.ModelCaches) *contr
 
 	adaptor = wrapPlugin(c.Request.Context(), mc, adaptor)
 
-	return controller.Handle(adaptor, c, meta, adaptorStore)
+	return controller.Handle(adaptor, c, meta, AdaptorStore, buildBodyDetailOption(meta))
 }
 
 func defaultPriceFunc(_ *gin.Context, mc model.ModelConfig) (model.Price, error) {
@@ -132,9 +169,11 @@ func relayController(m mode.Mode) RelayController {
 
 	switch m {
 	case mode.ImagesGenerations:
+		c.ValidateRequest = controller.ValidateImagesRequest
 		c.GetRequestPrice = controller.GetImagesRequestPrice
 		c.GetRequestUsage = controller.GetImagesRequestUsage
 	case mode.ImagesEdits:
+		c.ValidateRequest = controller.ValidateImagesEditsRequest
 		c.GetRequestPrice = controller.GetImagesEditsRequestPrice
 		c.GetRequestUsage = controller.GetImagesEditsRequestUsage
 	case mode.AudioSpeech:
@@ -156,7 +195,25 @@ func relayController(m mode.Mode) RelayController {
 	case mode.Completions:
 		c.GetRequestUsage = controller.GetCompletionsRequestUsage
 	case mode.VideoGenerationsJobs:
+		c.ValidateRequest = controller.ValidateVideoGenerationJobRequest
+		c.GetRequestPrice = controller.GetVideoGenerationJobRequestPrice
 		c.GetRequestUsage = controller.GetVideoGenerationJobRequestUsage
+	case mode.Videos, mode.VideosRemix, mode.VideosEdits, mode.VideosExtensions:
+		c.ValidateRequest = controller.ValidateVideosRequest
+		c.GetRequestPrice = controller.GetVideosRequestPrice
+		c.GetRequestUsage = controller.GetVideosRequestUsage
+	case mode.GeminiVideo:
+		c.ValidateRequest = controller.ValidateGeminiVideoRequest
+		c.GetRequestPrice = controller.GetGeminiVideoRequestPrice
+		c.GetRequestUsage = controller.GetGeminiVideoRequestUsage
+	case mode.AliVideo:
+		c.ValidateRequest = controller.ValidateAliVideoRequest
+		c.GetRequestPrice = controller.GetAliVideoRequestPrice
+		c.GetRequestUsage = controller.GetAliVideoRequestUsage
+	case mode.DoubaoVideo:
+		c.ValidateRequest = controller.ValidateDoubaoVideoRequest
+		c.GetRequestPrice = controller.GetDoubaoVideoRequestPrice
+		c.GetRequestUsage = controller.GetDoubaoVideoRequestUsage
 	case mode.Responses:
 		c.GetRequestUsage = controller.GetResponsesRequestUsage
 	}
@@ -197,6 +254,24 @@ func relay(c *gin.Context, mode mode.Mode, relayController RelayController) {
 	requestModel := middleware.GetRequestModel(c)
 	mc := middleware.GetModelConfig(c)
 
+	if relayController.ValidateRequest != nil {
+		if err := relayController.ValidateRequest(c, mc); err != nil {
+			statusCode := http.StatusInternalServerError
+
+			var requestParamErr *controller.RequestParamError
+			if errors.As(err, &requestParamErr) {
+				statusCode = requestParamErr.StatusCode
+			}
+
+			middleware.AbortLogWithMessageWithMode(mode, c,
+				statusCode,
+				err.Error(),
+			)
+
+			return
+		}
+	}
+
 	// Get initial channel
 	initialChannel, err := getInitialChannel(c, requestModel, mode)
 	if err != nil || initialChannel == nil || initialChannel.channel == nil {
@@ -234,11 +309,27 @@ func relay(c *gin.Context, mode mode.Mode, relayController RelayController) {
 			return
 		}
 
-		meta.RequestUsage = requestUsage
+		meta.RequestUsage = requestUsage.Usage
+		meta.RequestUsageContext = requestUsage.Context
 	}
 
+	meta.RequestUsageContext.ServiceTier = meta.RequestServiceTier
+
 	gbc := middleware.GetGroupBalanceConsumerFromContext(c)
-	if !gbc.CheckBalance(consume.CalculateAmount(http.StatusOK, meta.RequestUsage, price)) {
+
+	requiredBalance := math.Max(
+		consume.CalculateAmountWithOptions(
+			http.StatusOK,
+			meta.RequestUsage,
+			meta.RequestUsageContext,
+			price,
+			model.PriceSelectionOptions{
+				DisableResolutionFuzzyMatch: mc.DisableResolutionFuzzyMatch,
+			},
+		),
+		middleware.GroupMinimumBalance,
+	)
+	if !gbc.CheckBalance(requiredBalance) {
 		middleware.AbortLogWithMessageWithMode(mode, c,
 			http.StatusForbidden,
 			fmt.Sprintf("group (%s) balance not enough", gbc.Group),
@@ -264,7 +355,6 @@ func relay(c *gin.Context, mode mode.Mode, relayController RelayController) {
 			result,
 			0,
 			true,
-			middleware.GetRequestUser(c),
 			middleware.GetRequestMetadata(c),
 		)
 
@@ -278,6 +368,7 @@ func relay(c *gin.Context, mode mode.Mode, relayController RelayController) {
 		meta,
 		result,
 		price,
+		time.Now(),
 	)
 
 	// Retry loop
@@ -292,7 +383,6 @@ func recordResult(
 	result *controller.HandleResult,
 	retryTimes int,
 	downstreamResult bool,
-	user string,
 	metadata map[string]string,
 ) {
 	code := http.StatusOK
@@ -306,24 +396,41 @@ func recordResult(
 
 	var detail *model.RequestDetail
 
-	firstByteAt := result.Detail.FirstByteAt
-	if config.GetSaveAllLogDetail() || meta.ModelConfig.ForceSaveDetail || code != http.StatusOK {
-		detail = &model.RequestDetail{
-			RequestBody:  result.Detail.RequestBody,
-			ResponseBody: result.Detail.ResponseBody,
-		}
+	var firstByteAt time.Time
+	if result.BodyDetail != nil {
+		firstByteAt = result.BodyDetail.FirstByteAt
+	}
+
+	forceSaveDetail := config.GetSaveAllLogDetail() || meta.ModelConfig.ForceSaveDetail
+	if forceSaveDetail || code != http.StatusOK {
+		detail = buildRequestDetailForLog(
+			result.BodyDetail,
+			meta.ModelConfig,
+			code,
+			forceSaveDetail,
+		)
 	}
 
 	gbc := middleware.GetGroupBalanceConsumerFromContext(c)
+	usageContext := result.UsageContext.WithFallback(meta.RequestUsageContext)
 
-	amount := consume.CalculateAmount(
+	amount := consume.CalculateAmountWithOptions(
 		code,
 		result.Usage,
+		usageContext,
 		price,
+		model.PriceSelectionOptions{
+			DisableResolutionFuzzyMatch: meta.ModelConfig.DisableResolutionFuzzyMatch,
+		},
 	)
 	if amount > 0 {
 		log := common.GetLogger(c)
 		log.Data["amount"] = strconv.FormatFloat(amount, 'f', -1, 64)
+	}
+
+	asyncUsageStatus := model.AsyncUsageStatusNone
+	if downstreamResult && result.Error == nil && result.AsyncUsage {
+		asyncUsageStatus = model.AsyncUsageStatusPending
 	}
 
 	consume.AsyncConsume(
@@ -332,31 +439,139 @@ func recordResult(
 		firstByteAt,
 		meta,
 		result.Usage,
+		usageContext,
 		price,
 		content,
 		c.ClientIP(),
 		retryTimes,
 		detail,
 		downstreamResult,
-		user,
 		metadata,
+		result.UpstreamID,
+		asyncUsageStatus,
 	)
+
+	if asyncUsageStatus == model.AsyncUsageStatusPending {
+		saveAsyncUsageInfo(meta, price, result)
+	}
+}
+
+func saveAsyncUsageInfo(
+	meta *meta.Meta,
+	price model.Price,
+	result *controller.HandleResult,
+) {
+	if result.UpstreamID == "" {
+		log.Warnf("skip async usage without upstream id, request_id: %s", meta.RequestID)
+		return
+	}
+
+	if err := model.CreateAsyncUsageInfo(&model.AsyncUsageInfo{
+		RequestID:                   meta.RequestID,
+		RequestAt:                   meta.RequestAt,
+		Mode:                        int(meta.Mode),
+		Model:                       meta.OriginModel,
+		ChannelID:                   meta.Channel.ID,
+		BaseURL:                     meta.Channel.BaseURL,
+		GroupID:                     meta.Group.ID,
+		TokenID:                     meta.Token.ID,
+		TokenName:                   meta.Token.Name,
+		Price:                       price,
+		UpstreamID:                  result.UpstreamID,
+		UsageContext:                result.UsageContext.WithFallback(meta.RequestUsageContext),
+		DisableResolutionFuzzyMatch: meta.ModelConfig.DisableResolutionFuzzyMatch,
+	}); err != nil {
+		log.Errorf("failed to save async usage info: %v", err)
+	}
+}
+
+func effectiveDetailBodyMaxSize(modelLimit, globalLimit int64) int64 {
+	if modelLimit != 0 {
+		return modelLimit
+	}
+
+	return globalLimit
+}
+
+func buildRequestDetailForLog(
+	bodyDetail *controller.BodyDetail,
+	modelConfig model.ModelConfig,
+	code int,
+	forceSaveDetail bool,
+) *model.RequestDetail {
+	if bodyDetail == nil {
+		return nil
+	}
+
+	requestBodyMaxSize := effectiveDetailBodyMaxSize(
+		modelConfig.RequestBodyStorageMaxSize,
+		config.GetLogDetailRequestBodyMaxSize(),
+	)
+	responseBodyMaxSize := effectiveDetailBodyMaxSize(
+		modelConfig.ResponseBodyStorageMaxSize,
+		config.GetLogDetailResponseBodyMaxSize(),
+	)
+
+	detail := &model.RequestDetail{
+		RequestBody:  bodyDetail.RequestBody,
+		ResponseBody: bodyDetail.ResponseBody,
+	}
+	detail.DropInvalidUTF8Bodies()
+
+	if controller.ShouldSkipRequestBodyDetailForStatus(code) && !forceSaveDetail {
+		detail.RequestBody = ""
+	}
+
+	detail.ApplyBodySizeLimits(requestBodyMaxSize, responseBodyMaxSize)
+
+	return detail
+}
+
+func buildBodyDetailOption(meta *meta.Meta) controller.BodyDetailOption {
+	requestBodyMaxSize := effectiveDetailBodyMaxSize(
+		meta.ModelConfig.RequestBodyStorageMaxSize,
+		config.GetLogDetailRequestBodyMaxSize(),
+	)
+	responseBodyMaxSize := effectiveDetailBodyMaxSize(
+		meta.ModelConfig.ResponseBodyStorageMaxSize,
+		config.GetLogDetailResponseBodyMaxSize(),
+	)
+
+	return controller.BodyDetailOption{
+		IncludeRequestBody:  requestBodyMaxSize >= 0,
+		IncludeResponseBody: responseBodyMaxSize >= 0,
+		MaxRequestBodySize:  requestBodyMaxSize,
+		MaxResponseBodySize: responseBodyMaxSize,
+	}
 }
 
 type retryState struct {
-	retryTimes               int
-	lastHasPermissionChannel *model.Channel
-	ignoreChannelIDs         map[int64]struct{}
-	errorRates               map[int64]float64
-	exhausted                bool
-	failedChannelIDs         map[int64]struct{} // Track all failed channels in this request
+	retryTimes                           int
+	lastMinErrorRateHasPermissionChannel *model.Channel
+	preferChannelIDs                     []int
+	ignoreChannelIDs                     map[int64]struct{}
+	exhausted                            bool
+	failedChannelIDs                     map[int64]struct{} // Track all failed channels in this request
 
-	meta             *meta.Meta
-	price            model.Price
-	requestUsage     model.Usage
-	result           *controller.HandleResult
-	migratedChannels []*model.Channel
+	meta                *meta.Meta
+	price               model.Price
+	requestUsage        model.Usage
+	requestUsageContext model.UsageContext
+	result              *controller.HandleResult
+	migratedChannels    []*model.Channel
+	channelRetryInfo    map[int]channelRetryInfo
 }
+
+type channelRetryInfo struct {
+	failures  int
+	lastEndAt time.Time
+}
+
+const (
+	relayRetryBaseDelay = time.Second
+	relayRetryMaxDelay  = 5 * time.Second
+	relayRetryMaxJitter = time.Second
+)
 
 func handleRelayResult(
 	c *gin.Context,
@@ -384,21 +599,27 @@ func initRetryState(
 	meta *meta.Meta,
 	result *controller.HandleResult,
 	price model.Price,
+	initialEndAt time.Time,
 ) *retryState {
 	state := &retryState{
-		retryTimes:       retryTimes,
-		ignoreChannelIDs: channel.ignoreChannelIDs,
-		errorRates:       channel.errorRates,
-		meta:             meta,
-		result:           result,
-		price:            price,
-		requestUsage:     meta.RequestUsage,
-		migratedChannels: channel.migratedChannels,
-		failedChannelIDs: make(map[int64]struct{}),
+		retryTimes:          retryTimes,
+		preferChannelIDs:    channel.preferChannelIDs,
+		ignoreChannelIDs:    channel.ignoreChannelIDs,
+		meta:                meta,
+		result:              result,
+		price:               price,
+		requestUsage:        meta.RequestUsage,
+		requestUsageContext: meta.RequestUsageContext,
+		migratedChannels:    channel.migratedChannels,
+		failedChannelIDs:    make(map[int64]struct{}),
+		channelRetryInfo:    make(map[int]channelRetryInfo),
 	}
 
 	// Record initial failed channel
 	state.failedChannelIDs[int64(meta.Channel.ID)] = struct{}{}
+	if shouldBackoffStatus(result.Error.StatusCode()) {
+		state.recordChannelFailure(meta.Channel.ID, initialEndAt)
+	}
 
 	if channel.designatedChannel {
 		state.exhausted = true
@@ -411,10 +632,62 @@ func initRetryState(
 
 		state.ignoreChannelIDs[int64(channel.channel.ID)] = struct{}{}
 	} else {
-		state.lastHasPermissionChannel = channel.channel
+		state.lastMinErrorRateHasPermissionChannel = channel.channel
 	}
 
 	return state
+}
+
+func (s *retryState) recordChannelFailure(channelID int, endAt time.Time) {
+	if s.channelRetryInfo == nil {
+		s.channelRetryInfo = make(map[int]channelRetryInfo)
+	}
+
+	info := s.channelRetryInfo[channelID]
+	info.failures++
+	info.lastEndAt = endAt
+	s.channelRetryInfo[channelID] = info
+}
+
+func calculateRelayBackoffDelay(failures int, jitter time.Duration) time.Duration {
+	if failures <= 0 {
+		return 0
+	}
+
+	if jitter < 0 {
+		jitter = 0
+	}
+
+	if jitter > relayRetryMaxJitter {
+		jitter = relayRetryMaxJitter
+	}
+
+	delay := time.Duration(failures)*relayRetryBaseDelay + jitter
+	if delay > relayRetryMaxDelay {
+		return relayRetryMaxDelay
+	}
+
+	return delay
+}
+
+func (s *retryState) remainingRelayDelay(
+	channelID int,
+	now time.Time,
+	jitter time.Duration,
+) time.Duration {
+	info, ok := s.channelRetryInfo[channelID]
+	if !ok || info.failures <= 0 || info.lastEndAt.IsZero() {
+		return 0
+	}
+
+	requiredDelay := calculateRelayBackoffDelay(info.failures, jitter)
+
+	elapsed := now.Sub(info.lastEndAt)
+	if elapsed >= requiredDelay {
+		return 0
+	}
+
+	return requiredDelay - elapsed
 }
 
 func retryLoop(c *gin.Context, mode mode.Mode, state *retryState, relayController RelayHandler) {
@@ -424,10 +697,7 @@ func retryLoop(c *gin.Context, mode mode.Mode, state *retryState, relayControlle
 	i := 0
 
 	for {
-		lastStatusCode := state.result.Error.StatusCode()
-		lastChannelID := state.meta.Channel.ID
-
-		newChannel, err := getRetryChannel(state, i, state.retryTimes)
+		newChannel, err := getRetryChannel(c.Request.Context(), state)
 		if err == nil {
 			err = prepareRetry(c)
 		}
@@ -445,7 +715,6 @@ func retryLoop(c *gin.Context, mode mode.Mode, state *retryState, relayControlle
 					state.result,
 					i,
 					true,
-					middleware.GetRequestUser(c),
 					middleware.GetRequestMetadata(c),
 				)
 			}
@@ -461,7 +730,6 @@ func retryLoop(c *gin.Context, mode mode.Mode, state *retryState, relayControlle
 				state.result,
 				i,
 				false,
-				middleware.GetRequestUser(c),
 				middleware.GetRequestMetadata(c),
 			)
 			state.meta = nil
@@ -477,22 +745,23 @@ func retryLoop(c *gin.Context, mode mode.Mode, state *retryState, relayControlle
 			state.retryTimes-i,
 		)
 
-		// Check if we should delay (using the same channel)
-		if shouldDelay(lastStatusCode, lastChannelID, newChannel.ID) {
-			relayDelay()
-		}
+		relayDelay(state, newChannel.ID)
 
 		state.meta = NewMetaByContext(
 			c,
 			newChannel,
 			mode,
 			meta.WithRequestUsage(state.requestUsage),
+			meta.WithRequestUsageContext(state.requestUsageContext),
 			meta.WithRetryAt(time.Now()),
 		)
 
 		var retry bool
 
 		state.result, retry = RelayHelper(c, state.meta, relayController)
+		if state.result.Error != nil && shouldBackoffStatus(state.result.Error.StatusCode()) {
+			state.recordChannelFailure(newChannel.ID, time.Now())
+		}
 
 		done := handleRetryResult(c, retry, newChannel, state)
 
@@ -509,7 +778,6 @@ func retryLoop(c *gin.Context, mode mode.Mode, state *retryState, relayControlle
 				state.result,
 				i+1,
 				true,
-				middleware.GetRequestUser(c),
 				middleware.GetRequestMetadata(c),
 			)
 
@@ -564,27 +832,55 @@ func handleRetryResult(
 			state.ignoreChannelIDs[int64(newChannel.ID)] = struct{}{}
 			state.retryTimes++
 		} else {
-			state.lastHasPermissionChannel = newChannel
+			if state.lastMinErrorRateHasPermissionChannel == nil {
+				state.lastMinErrorRateHasPermissionChannel = newChannel
+				return false
+			}
+
+			currentErrorRate, err := monitor.GetChannelModelErrorRate(
+				ctx.Request.Context(),
+				state.meta.OriginModel,
+				int64(state.lastMinErrorRateHasPermissionChannel.ID),
+			)
+			if err != nil {
+				return false
+			}
+
+			newErrorRate, err := monitor.GetChannelModelErrorRate(
+				ctx.Request.Context(),
+				state.meta.OriginModel,
+				int64(newChannel.ID),
+			)
+			if err != nil {
+				return false
+			}
+
+			state.lastMinErrorRateHasPermissionChannel = pickMinErrorRateHasPermissionChannel(
+				state.lastMinErrorRateHasPermissionChannel,
+				currentErrorRate,
+				newChannel,
+				newErrorRate,
+			)
 		}
 	}
 
 	return false
 }
 
-// shouldDelay checks if we need to add a delay before retrying
-// Only adds delay when retrying with the same channel for rate limiting issues
-func shouldDelay(statusCode, lastChannelID, newChannelID int) bool {
-	if lastChannelID != newChannelID {
-		return false
-	}
-
-	// Only delay for rate limiting or service unavailable errors
+func shouldBackoffStatus(statusCode int) bool {
 	return statusCode == http.StatusTooManyRequests ||
 		statusCode == http.StatusServiceUnavailable
 }
 
-func relayDelay() {
-	time.Sleep(time.Duration(rand.Float64()*float64(time.Second)) + time.Second)
+func relayDelay(state *retryState, channelID int) {
+	jitter := time.Duration(rand.Int64N(int64(relayRetryMaxJitter)))
+
+	delay := state.remainingRelayDelay(channelID, time.Now(), jitter)
+	if delay <= 0 {
+		return
+	}
+
+	time.Sleep(delay)
 }
 
 func RelayNotImplemented(c *gin.Context) {
@@ -613,7 +909,7 @@ func ErrorWithRequestID(c *gin.Context, relayErr adaptor.Error) {
 		return
 	}
 
-	node, err := sonic.Get(data)
+	node, err := common.GetJSONNodeNoCopy(data)
 	if err != nil {
 		log.Errorf("get node failed: %+v", err)
 		c.JSON(relayErr.StatusCode(), relayErr)

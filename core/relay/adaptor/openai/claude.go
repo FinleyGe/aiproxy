@@ -10,7 +10,6 @@ import (
 	"github.com/bytedance/sonic"
 	"github.com/gin-gonic/gin"
 	"github.com/labring/aiproxy/core/common"
-	"github.com/labring/aiproxy/core/model"
 	"github.com/labring/aiproxy/core/relay/adaptor"
 	"github.com/labring/aiproxy/core/relay/meta"
 	relaymodel "github.com/labring/aiproxy/core/relay/model"
@@ -22,10 +21,21 @@ import (
 func ConvertClaudeRequest(
 	meta *meta.Meta,
 	req *http.Request,
+	hooks ...OpenAIRequestHook,
 ) (adaptor.ConvertResult, error) {
 	openAIRequest, err := ConvertClaudeRequestModel(meta, req)
 	if err != nil {
 		return adaptor.ConvertResult{}, err
+	}
+
+	for _, hook := range hooks {
+		if hook == nil {
+			continue
+		}
+
+		if err := hook(openAIRequest); err != nil {
+			return adaptor.ConvertResult{}, err
+		}
 	}
 
 	// Marshal the converted request
@@ -85,6 +95,12 @@ func ConvertClaudeRequestModel(
 			IncludeUsage: true,
 		}
 	}
+
+	applyReasoningToOpenAIRequestForModel(
+		meta,
+		&openAIRequest,
+		utils.ParseClaudeReasoning(claudeRequest.Thinking, claudeRequest.OutputConfig),
+	)
 
 	return &openAIRequest, nil
 }
@@ -328,16 +344,16 @@ func ClaudeStreamHandler(
 	meta *meta.Meta,
 	c *gin.Context,
 	resp *http.Response,
-) (model.Usage, adaptor.Error) {
+) (adaptor.DoResponseResult, adaptor.Error) {
 	if resp.StatusCode != http.StatusOK {
-		return model.Usage{}, ClaudeErrorHandler(resp)
+		return adaptor.DoResponseResult{}, ClaudeErrorHandler(resp)
 	}
 
 	defer resp.Body.Close()
 
 	log := common.GetLogger(c)
 
-	scanner, cleanup := utils.NewStreamScanner(resp.Body, meta.ActualModel)
+	scanner, cleanup := utils.NewStreamScanner(resp.Body, meta.OriginModel, meta.ActualModel)
 	defer cleanup()
 
 	// Initialize Claude response tracking
@@ -399,7 +415,7 @@ func ClaudeStreamHandler(
 					ID:      messageID,
 					Type:    relaymodel.ClaudeTypeMessage,
 					Role:    relaymodel.RoleAssistant,
-					Model:   meta.ActualModel,
+					Model:   responseModelName(meta),
 					Content: []relaymodel.ClaudeContent{},
 				},
 			}
@@ -573,7 +589,7 @@ func ClaudeStreamHandler(
 		Type: relaymodel.ClaudeStreamTypeMessageStop,
 	})
 
-	return usage.ToModelUsage(), nil
+	return adaptor.DoResponseResult{Usage: usage.ToModelUsage()}, nil
 }
 
 // ClaudeHandler handles OpenAI non-streaming responses and converts them to Claude format
@@ -581,9 +597,9 @@ func ClaudeHandler(
 	meta *meta.Meta,
 	c *gin.Context,
 	resp *http.Response,
-) (model.Usage, adaptor.Error) {
+) (adaptor.DoResponseResult, adaptor.Error) {
 	if resp.StatusCode != http.StatusOK {
-		return model.Usage{}, ClaudeErrorHandler(resp)
+		return adaptor.DoResponseResult{}, ClaudeErrorHandler(resp)
 	}
 
 	defer resp.Body.Close()
@@ -591,7 +607,7 @@ func ClaudeHandler(
 	// Read OpenAI response
 	body, err := common.GetResponseBody(resp)
 	if err != nil {
-		return model.Usage{}, relaymodel.WrapperOpenAIError(
+		return adaptor.DoResponseResult{}, relaymodel.WrapperOpenAIError(
 			err,
 			"read_response_body_failed",
 			http.StatusInternalServerError,
@@ -603,7 +619,7 @@ func ClaudeHandler(
 
 	err = sonic.Unmarshal(body, &openAIResponse)
 	if err != nil {
-		return model.Usage{}, relaymodel.WrapperOpenAIError(
+		return adaptor.DoResponseResult{}, relaymodel.WrapperOpenAIError(
 			err,
 			"unmarshal_response_body_failed",
 			http.StatusInternalServerError,
@@ -615,7 +631,7 @@ func ClaudeHandler(
 		ID:           "msg_" + common.ShortUUID(),
 		Type:         relaymodel.ClaudeTypeMessage,
 		Role:         relaymodel.RoleAssistant,
-		Model:        meta.ActualModel,
+		Model:        responseModelName(meta),
 		Content:      []relaymodel.ClaudeContent{},
 		StopReason:   "",
 		StopSequence: nil,
@@ -679,7 +695,7 @@ func ClaudeHandler(
 	// Marshal Claude response
 	claudeResponseData, err := sonic.Marshal(claudeResponse)
 	if err != nil {
-		return model.Usage{}, relaymodel.WrapperOpenAIError(
+		return adaptor.DoResponseResult{}, relaymodel.WrapperOpenAIError(
 			err,
 			"marshal_response_body_failed",
 			http.StatusInternalServerError,
@@ -691,7 +707,7 @@ func ClaudeHandler(
 	c.Writer.Header().Set("Content-Length", strconv.Itoa(len(claudeResponseData)))
 	_, _ = c.Writer.Write(claudeResponseData)
 
-	return claudeResponse.Usage.ToOpenAIUsage().ToModelUsage(), nil
+	return adaptor.DoResponseResult{Usage: claudeResponse.Usage.ToOpenAIUsage().ToModelUsage()}, nil
 }
 
 // convertFinishReasonToClaude converts OpenAI finish reason to Claude stop reason
@@ -808,6 +824,12 @@ func ConvertClaudeToResponsesRequest(
 		responsesReq.ToolChoice = openAIRequest.ToolChoice
 	}
 
+	applyReasoningToResponsesRequestForModel(
+		meta,
+		&responsesReq,
+		utils.ParseOpenAIReasoning(openAIRequest),
+	)
+
 	// Force non-store mode
 	storeValue := false
 	responsesReq.Store = &storeValue
@@ -832,16 +854,16 @@ func ConvertResponsesToClaudeResponse(
 	meta *meta.Meta,
 	c *gin.Context,
 	resp *http.Response,
-) (model.Usage, adaptor.Error) {
+) (adaptor.DoResponseResult, adaptor.Error) {
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return model.Usage{}, ErrorHanlder(resp)
+		return adaptor.DoResponseResult{}, ErrorHanlder(resp)
 	}
 
 	defer resp.Body.Close()
 
 	responseBody, err := common.GetResponseBody(resp)
 	if err != nil {
-		return model.Usage{}, relaymodel.WrapperOpenAIError(
+		return adaptor.DoResponseResult{}, relaymodel.WrapperOpenAIError(
 			err,
 			"read_response_body_failed",
 			http.StatusInternalServerError,
@@ -852,7 +874,7 @@ func ConvertResponsesToClaudeResponse(
 
 	err = sonic.Unmarshal(responseBody, &responsesResp)
 	if err != nil {
-		return model.Usage{}, relaymodel.WrapperOpenAIError(
+		return adaptor.DoResponseResult{}, relaymodel.WrapperOpenAIError(
 			err,
 			"unmarshal_response_body_failed",
 			http.StatusInternalServerError,
@@ -864,7 +886,7 @@ func ConvertResponsesToClaudeResponse(
 		ID:      responsesResp.ID,
 		Type:    relaymodel.ClaudeTypeMessage,
 		Role:    relaymodel.RoleAssistant,
-		Model:   responsesResp.Model,
+		Model:   responseModelName(meta),
 		Content: []relaymodel.ClaudeContent{},
 	}
 
@@ -915,7 +937,7 @@ func ConvertResponsesToClaudeResponse(
 	// Marshal and return
 	claudeRespData, err := sonic.Marshal(claudeResp)
 	if err != nil {
-		return model.Usage{}, relaymodel.WrapperOpenAIError(
+		return adaptor.DoResponseResult{}, relaymodel.WrapperOpenAIError(
 			err,
 			"marshal_response_body_failed",
 			http.StatusInternalServerError,
@@ -926,11 +948,11 @@ func ConvertResponsesToClaudeResponse(
 	c.Writer.Header().Set("Content-Length", strconv.Itoa(len(claudeRespData)))
 	_, _ = c.Writer.Write(claudeRespData)
 
-	if responsesResp.Usage != nil {
-		return responsesResp.Usage.ToModelUsage(), nil
-	}
-
-	return model.Usage{}, nil
+	return adaptor.DoResponseResult{
+		Usage:      responsesResp.ToModelUsage(),
+		UpstreamID: responsesResp.ID,
+		AsyncUsage: responseNeedsAsyncUsage(&responsesResp),
+	}, nil
 }
 
 // ConvertResponsesToClaudeStreamResponse converts Responses API stream to Claude stream
@@ -938,19 +960,23 @@ func ConvertResponsesToClaudeStreamResponse(
 	meta *meta.Meta,
 	c *gin.Context,
 	resp *http.Response,
-) (model.Usage, adaptor.Error) {
+) (adaptor.DoResponseResult, adaptor.Error) {
 	if resp.StatusCode != http.StatusOK {
-		return model.Usage{}, ErrorHanlder(resp)
+		return adaptor.DoResponseResult{}, ErrorHanlder(resp)
 	}
 
 	defer resp.Body.Close()
 
 	log := common.GetLogger(c)
 
-	scanner, cleanup := utils.NewStreamScanner(resp.Body, meta.ActualModel)
+	scanner, cleanup := utils.NewStreamScanner(resp.Body, meta.OriginModel, meta.ActualModel)
 	defer cleanup()
 
-	var usage model.Usage
+	var (
+		errorState     responsesStreamErrorState
+		pendingCreated *relaymodel.ResponseStreamEvent
+		wroteStream    bool
+	)
 
 	state := &claudeStreamState{
 		meta: meta,
@@ -964,9 +990,6 @@ func ConvertResponsesToClaudeStreamResponse(
 		}
 
 		data = render.ExtractSSEData(data)
-		if render.IsSSEDone(data) {
-			break
-		}
 
 		// Parse the stream event
 		var event relaymodel.ResponseStreamEvent
@@ -977,10 +1000,56 @@ func ConvertResponsesToClaudeStreamResponse(
 			continue
 		}
 
+		errorState.update(&event)
+
+		if err := errorState.errorBeforeEvent(&event); err != nil {
+			return errorState.result(), err
+		}
+
+		if event.Type == relaymodel.EventResponseFailed || event.Type == relaymodel.EventError {
+			if wroteStream {
+				log.Error(
+					"response stream failed after data was sent: " + responseStreamErrorMessage(
+						&event,
+					),
+				)
+
+				break
+			}
+
+			err, handled := errorState.handleFailure(&event)
+			if handled && err == nil {
+				continue
+			}
+
+			if handled {
+				return errorState.result(), err
+			}
+		}
+
+		if event.Type == relaymodel.EventResponseCreated && !wroteStream {
+			pendingEvent := event
+			pendingCreated = &pendingEvent
+			continue
+		}
+
+		if pendingCreated != nil && !claudeResponseStreamEventWrites(event.Type) {
+			continue
+		}
+
+		if pendingCreated != nil {
+			state.handleResponseCreated(pendingCreated)
+
+			wroteStream = true
+			pendingCreated = nil
+		}
+
 		// Handle events
 		switch event.Type {
 		case relaymodel.EventResponseCreated:
 			state.handleResponseCreated(&event)
+
+			wroteStream = true
 		case relaymodel.EventOutputItemAdded:
 			state.handleOutputItemAdded(&event)
 		case relaymodel.EventContentPartAdded:
@@ -994,10 +1063,6 @@ func ConvertResponsesToClaudeStreamResponse(
 		case relaymodel.EventOutputItemDone:
 			state.handleOutputItemDone(&event)
 		case relaymodel.EventResponseCompleted, relaymodel.EventResponseDone:
-			if event.Response != nil && event.Response.Usage != nil {
-				usage = event.Response.Usage.ToModelUsage()
-			}
-
 			state.handleResponseCompleted(&event)
 		}
 	}
@@ -1006,7 +1071,27 @@ func ConvertResponsesToClaudeStreamResponse(
 		log.Error("error reading response stream: " + err.Error())
 	}
 
-	return usage, nil
+	if errorState.pendingFailure != nil && !wroteStream {
+		return errorState.result(), responseStreamError(errorState.pendingFailure)
+	}
+
+	return errorState.result(), nil
+}
+
+func claudeResponseStreamEventWrites(eventType string) bool {
+	switch eventType {
+	case relaymodel.EventOutputItemAdded,
+		relaymodel.EventContentPartAdded,
+		relaymodel.EventReasoningTextDelta,
+		relaymodel.EventOutputTextDelta,
+		relaymodel.EventFunctionCallArgumentsDelta,
+		relaymodel.EventOutputItemDone,
+		relaymodel.EventResponseCompleted,
+		relaymodel.EventResponseDone:
+		return true
+	default:
+		return false
+	}
 }
 
 // claudeStreamState manages state for Claude stream conversion
@@ -1039,7 +1124,7 @@ func (s *claudeStreamState) handleResponseCreated(event *relaymodel.ResponseStre
 			ID:      s.messageID,
 			Type:    relaymodel.ClaudeTypeMessage,
 			Role:    relaymodel.RoleAssistant,
-			Model:   event.Response.Model,
+			Model:   responseModelName(s.meta),
 			Content: []relaymodel.ClaudeContent{},
 		},
 	})

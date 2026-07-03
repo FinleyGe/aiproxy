@@ -21,6 +21,11 @@ type GroupResponse struct {
 func (g *GroupResponse) MarshalJSON() ([]byte, error) {
 	type Alias model.Group
 
+	accessedAt := int64(0)
+	if !g.AccessedAt.IsZero() {
+		accessedAt = g.AccessedAt.UnixMilli()
+	}
+
 	return sonic.Marshal(&struct {
 		*Alias
 		CreatedAt  int64 `json:"created_at,omitempty"`
@@ -28,7 +33,7 @@ func (g *GroupResponse) MarshalJSON() ([]byte, error) {
 	}{
 		Alias:      (*Alias)(g.Group),
 		CreatedAt:  g.CreatedAt.UnixMilli(),
-		AccessedAt: g.AccessedAt.UnixMilli(),
+		AccessedAt: accessedAt,
 	})
 }
 
@@ -454,15 +459,38 @@ type SaveGroupModelConfigRequest struct {
 	RPM           int64 `json:"rpm"`
 	TPM           int64 `json:"tpm"`
 
-	OverridePrice bool               `json:"override_price"`
-	ImagePrices   map[string]float64 `json:"image_prices"`
-	Price         model.Price        `json:"price"`
+	OverridePrice bool        `json:"override_price"`
+	Price         model.Price `json:"price"`
 
 	OverrideRetryTimes bool  `json:"override_retry_times"`
 	RetryTimes         int64 `json:"retry_times"`
 
+	OverrideTimeoutConfig bool                `json:"override_timeout_config"`
+	TimeoutConfig         model.TimeoutConfig `json:"timeout_config"`
+
 	OverrideForceSaveDetail bool `json:"override_force_save_detail"`
 	ForceSaveDetail         bool `json:"force_save_detail"`
+
+	OverrideMaxImageGenerationCount bool `json:"override_max_image_generation_count"`
+	MaxImageGenerationCount         int  `json:"max_image_generation_count"`
+
+	OverrideMaxVideoGenerationSeconds bool `json:"override_max_video_generation_seconds"`
+	MaxVideoGenerationSeconds         int  `json:"max_video_generation_seconds"`
+
+	OverrideMaxVideoGenerationCount bool `json:"override_max_video_generation_count"`
+	MaxVideoGenerationCount         int  `json:"max_video_generation_count"`
+
+	OverrideRequestBodyStorageMaxSize bool  `json:"override_request_body_storage_max_size"`
+	RequestBodyStorageMaxSize         int64 `json:"request_body_storage_max_size"`
+
+	OverrideResponseBodyStorageMaxSize bool  `json:"override_response_body_storage_max_size"`
+	ResponseBodyStorageMaxSize         int64 `json:"response_body_storage_max_size"`
+
+	OverrideSummaryServiceTier bool `json:"override_summary_service_tier"`
+	SummaryServiceTier         bool `json:"summary_service_tier"`
+
+	OverrideSummaryClaudeLongContext bool `json:"override_summary_claude_long_context"`
+	SummaryClaudeLongContext         bool `json:"summary_claude_long_context"`
 }
 
 func (r *SaveGroupModelConfigRequest) ToGroupModelConfig(groupID string) model.GroupModelConfig {
@@ -475,14 +503,30 @@ func (r *SaveGroupModelConfigRequest) ToGroupModelConfig(groupID string) model.G
 		TPM:           r.TPM,
 
 		OverridePrice: r.OverridePrice,
-		ImagePrices:   r.ImagePrices,
 		Price:         r.Price,
 
 		OverrideRetryTimes: r.OverrideRetryTimes,
 		RetryTimes:         r.RetryTimes,
 
-		OverrideForceSaveDetail: r.OverrideForceSaveDetail,
-		ForceSaveDetail:         r.ForceSaveDetail,
+		OverrideTimeoutConfig: r.OverrideTimeoutConfig,
+		TimeoutConfig:         r.TimeoutConfig,
+
+		OverrideForceSaveDetail:            r.OverrideForceSaveDetail,
+		ForceSaveDetail:                    r.ForceSaveDetail,
+		OverrideMaxImageGenerationCount:    r.OverrideMaxImageGenerationCount,
+		MaxImageGenerationCount:            r.MaxImageGenerationCount,
+		OverrideMaxVideoGenerationSeconds:  r.OverrideMaxVideoGenerationSeconds,
+		MaxVideoGenerationSeconds:          r.MaxVideoGenerationSeconds,
+		OverrideMaxVideoGenerationCount:    r.OverrideMaxVideoGenerationCount,
+		MaxVideoGenerationCount:            r.MaxVideoGenerationCount,
+		OverrideRequestBodyStorageMaxSize:  r.OverrideRequestBodyStorageMaxSize,
+		RequestBodyStorageMaxSize:          r.RequestBodyStorageMaxSize,
+		OverrideResponseBodyStorageMaxSize: r.OverrideResponseBodyStorageMaxSize,
+		ResponseBodyStorageMaxSize:         r.ResponseBodyStorageMaxSize,
+		OverrideSummaryServiceTier:         r.OverrideSummaryServiceTier,
+		SummaryServiceTier:                 r.SummaryServiceTier,
+		OverrideSummaryClaudeLongContext:   r.OverrideSummaryClaudeLongContext,
+		SummaryClaudeLongContext:           r.SummaryClaudeLongContext,
 	}
 }
 

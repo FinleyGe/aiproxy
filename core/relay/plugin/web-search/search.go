@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,7 +44,8 @@ type GetChannel func(modelName string) (*model.Channel, error)
 // WebSearch implements web search functionality
 type WebSearch struct {
 	noop.Noop
-	GetChannel GetChannel
+	GetChannel  GetChannel
+	configCache utils.PluginConfigCache[Config]
 }
 
 // NewWebSearchPlugin creates a new web search plugin
@@ -93,12 +95,7 @@ func getRewriteUsage(m *meta.Meta) *model.Usage {
 }
 
 func (p *WebSearch) getConfig(meta *meta.Meta) (Config, error) {
-	pluginConfig := Config{}
-	if err := meta.ModelConfig.LoadPluginConfig("web-search", &pluginConfig); err != nil {
-		return Config{}, err
-	}
-
-	return pluginConfig, nil
+	return p.configCache.Load(meta, "web-search", Config{})
 }
 
 func lazyRemoveSearchOption(meta *meta.Meta) {
@@ -164,6 +161,7 @@ func (p *WebSearch) ConvertRequest(
 	if err != nil {
 		return fallback(log, meta, store, req, do, fmt.Sprintf("init engines failed: %v", err))
 	}
+
 	if len(engines) == 0 {
 		return fallback(log, meta, store, req, do, "no search engines configured")
 	}
@@ -374,8 +372,8 @@ func (p *WebSearch) initializeSearchEngines(configs []EngineConfig) ([]engine.En
 
 // extractUserQuery finds the last user message in the conversation
 func (p *WebSearch) extractUserQuery(messages []any) (int, string) {
-	for i := len(messages) - 1; i >= 0; i-- {
-		msg, ok := messages[i].(map[string]any)
+	for i, v := range slices.Backward(messages) {
+		msg, ok := v.(map[string]any)
 		if !ok {
 			continue
 		}
@@ -511,7 +509,7 @@ func (p *WebSearch) generateSearchContexts(
 	setRewriteUsage(m, result.Usage)
 
 	// Extract content from response
-	contentNode, err := sonic.Get(w.Body.Bytes(), "choices", 0, "message", "content")
+	contentNode, err := common.GetJSONNodeNoCopy(w.Body.Bytes(), "choices", 0, "message", "content")
 	if err != nil {
 		return nil, err
 	}
@@ -701,7 +699,7 @@ func (rw *responseWriter) Write(b []byte) (int, error) {
 		rw.isStream = true
 	}
 
-	node, err := sonic.Get(b)
+	node, err := common.GetJSONNodeNoCopy(b)
 	if err != nil || !node.Valid() {
 		return rw.ResponseWriter.Write(b)
 	}
@@ -761,7 +759,10 @@ func (rw *responseWriter) processWebSearchCount(node *ast.Node) {
 		)
 	} else {
 		// If not exists, set the value
-		_, _ = usageNode.Set("web_search_count", ast.NewNumber(strconv.FormatInt(int64(rw.webSearchCount), 10)))
+		_, _ = usageNode.Set(
+			"web_search_count",
+			ast.NewNumber(strconv.FormatInt(int64(rw.webSearchCount), 10)),
+		)
 	}
 }
 
@@ -829,7 +830,7 @@ func (p *WebSearch) DoResponse(
 	c *gin.Context,
 	resp *http.Response,
 	do adaptor.DoResponse,
-) (model.Usage, adaptor.Error) {
+) (adaptor.DoResponseResult, adaptor.Error) {
 	if meta.Mode != mode.ChatCompletions {
 		return do.DoResponse(meta, store, c, resp)
 	}
@@ -886,13 +887,13 @@ func (p *WebSearch) doResponseWithCount(
 	resp *http.Response,
 	do adaptor.DoResponse,
 	count int,
-) (model.Usage, adaptor.Error) {
-	u, err := do.DoResponse(meta, store, c, resp)
+) (adaptor.DoResponseResult, adaptor.Error) {
+	result, err := do.DoResponse(meta, store, c, resp)
 	if err != nil {
-		return model.Usage{}, err
+		return adaptor.DoResponseResult{}, err
 	}
 
-	u.WebSearchCount += model.ZeroNullInt64(int64(count))
+	result.Usage.WebSearchCount += model.ZeroNullInt64(int64(count))
 
-	return u, nil
+	return result, nil
 }

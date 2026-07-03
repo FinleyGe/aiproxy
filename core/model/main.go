@@ -227,6 +227,7 @@ func migrateLogDB(batchSize int) error {
 		&GroupSummary{},
 		&Summary{},
 		&ConsumeError{},
+		&AsyncUsageInfo{},
 		&StoreV2{},
 		&SummaryMinute{},
 		&GroupSummaryMinute{},
@@ -364,6 +365,15 @@ func preMigrationCleanup(batchSize int) error {
 			return nil
 		}
 		return fmt.Errorf("failed to cleanup request details: %w", err)
+	}
+
+	// Clean up expired stores
+	err = preMigrationCleanupStores()
+	if err != nil {
+		if ignoreNoSuchTable(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to cleanup stores: %w", err)
 	}
 
 	log.Info("pre-migration cleanup completed")
@@ -533,4 +543,12 @@ func preMigrationCleanupRequestDetails(batchSize int) error {
 	}
 
 	return nil
+}
+
+func preMigrationCleanupStores() error {
+	return LogDB.
+		Session(&gorm.Session{SkipDefaultTransaction: true}).
+		Where("expires_at < ?", time.Now()).
+		Delete(&StoreV2{}).
+		Error
 }

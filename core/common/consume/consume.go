@@ -27,14 +27,16 @@ func AsyncConsume(
 	firstByteAt time.Time,
 	meta *meta.Meta,
 	usage model.Usage,
+	usageContext model.UsageContext,
 	modelPrice model.Price,
 	content string,
 	ip string,
 	retryTimes int,
 	requestDetail *model.RequestDetail,
 	downstreamResult bool,
-	user string,
 	metadata map[string]string,
+	upstreamID string,
+	asyncUsageStatus model.AsyncUsageStatus,
 ) {
 	if !checkNeedRecordConsume(code, meta) {
 		return
@@ -57,14 +59,16 @@ func AsyncConsume(
 		code,
 		meta,
 		usage,
+		usageContext,
 		modelPrice,
 		content,
 		ip,
 		retryTimes,
 		requestDetail,
 		downstreamResult,
-		user,
 		metadata,
+		upstreamID,
+		asyncUsageStatus,
 	)
 }
 
@@ -76,40 +80,74 @@ func Consume(
 	code int,
 	meta *meta.Meta,
 	usage model.Usage,
+	usageContext model.UsageContext,
 	modelPrice model.Price,
 	content string,
 	ip string,
 	retryTimes int,
 	requestDetail *model.RequestDetail,
 	downstreamResult bool,
-	user string,
 	metadata map[string]string,
+	upstreamID string,
+	asyncUsageStatus model.AsyncUsageStatus,
 ) {
 	if !checkNeedRecordConsume(code, meta) {
 		return
 	}
 
-	amount := CalculateAmount(code, usage, modelPrice)
-	amount = consumeAmount(ctx, amount, postGroupConsumer, meta)
+	recordUsage := usage
 
-	selectedModelPrice := modelPrice.SelectConditionalPrice(usage)
-	selectedModelPrice.ConditionalPrices = nil
+	amountDetail := model.Amount{}
+	if asyncUsageStatus == model.AsyncUsageStatusPending {
+		recordUsage = model.Usage{}
+	} else {
+		amountDetail = CalculateAmountDetailWithOptions(
+			code,
+			recordUsage,
+			usageContext,
+			modelPrice,
+			priceSelectionOptions(meta),
+		)
+	}
+
+	if downstreamResult {
+		// TODO: add record actual consume amount
+		_ = consumeAmount(ctx, amountDetail.UsedAmount, postGroupConsumer, meta)
+	} else if amountDetail.UsedAmount != 0 {
+		log.Warnf(
+			"not downstream result but used amount is not zero, request_id: %s, used_amount: %f",
+			meta.RequestID,
+			amountDetail.UsedAmount,
+		)
+	}
+
+	selectedModelPrice := model.Price{}
+	if asyncUsageStatus != model.AsyncUsageStatusPending {
+		selectedModelPrice = modelPrice.SelectConditionalPriceWithOptions(
+			usage,
+			usageContext,
+			priceSelectionOptions(meta),
+		)
+		selectedModelPrice.ConditionalPrices = nil
+	}
 
 	err := recordConsume(
 		now,
 		meta,
 		code,
 		firstByteAt,
-		usage,
+		recordUsage,
+		usageContext,
 		selectedModelPrice,
 		content,
 		ip,
 		requestDetail,
-		amount,
+		amountDetail,
 		retryTimes,
 		downstreamResult,
-		user,
 		metadata,
+		upstreamID,
+		asyncUsageStatus,
 	)
 	if err != nil {
 		log.Error("error batch record consume: " + err.Error())
@@ -122,10 +160,17 @@ func Summary(
 	firstByteAt time.Time,
 	meta *meta.Meta,
 	usage model.Usage,
+	usageContext model.UsageContext,
 	modelPrice model.Price,
 	downstreamResult bool,
 ) {
-	amount := CalculateAmount(code, usage, modelPrice)
+	amountDetail := CalculateAmountDetailWithOptions(
+		code,
+		usage,
+		usageContext,
+		modelPrice,
+		priceSelectionOptions(meta),
+	)
 
 	recordSummary(
 		time.Now(),
@@ -133,23 +178,41 @@ func Summary(
 		code,
 		firstByteAt,
 		usage,
-		amount,
+		amountDetail,
 		downstreamResult,
+		usageContext.ServiceTier,
 	)
 }
 
 func checkNeedRecordConsume(code int, meta *meta.Meta) bool {
+	if meta == nil {
+		return true
+	}
+
 	switch meta.Mode {
 	case mode.VideoGenerationsGetJobs,
 		mode.VideoGenerationsContent,
+		mode.VideosGet,
+		mode.VideosContent,
+		mode.VideosDelete,
+		mode.GeminiFiles,
+		mode.GeminiVideoOperations,
+		mode.AliVideoTasks,
+		mode.DoubaoVideoTasks,
 		mode.ResponsesGet,
 		mode.ResponsesDelete,
 		mode.ResponsesCancel,
 		mode.ResponsesInputItems:
 		return code != http.StatusOK
+	case mode.DoubaoVideoTasksDelete:
+		return code != http.StatusOK && code != http.StatusNoContent
 	default:
 		return true
 	}
+}
+
+func NeedRecordConsumeForTest(code int, meta *meta.Meta) bool {
+	return checkNeedRecordConsume(code, meta)
 }
 
 func consumeAmount(
@@ -164,19 +227,39 @@ func consumeAmount(
 	return amount
 }
 
-func CalculateAmount(
+func CalculateAmountDetail(
 	code int,
 	usage model.Usage,
+	usageContext model.UsageContext,
 	modelPrice model.Price,
-) float64 {
+) model.Amount {
+	return CalculateAmountDetailWithOptions(
+		code,
+		usage,
+		usageContext,
+		modelPrice,
+		model.PriceSelectionOptions{},
+	)
+}
+
+func CalculateAmountDetailWithOptions(
+	code int,
+	usage model.Usage,
+	usageContext model.UsageContext,
+	modelPrice model.Price,
+	options model.PriceSelectionOptions,
+) model.Amount {
 	if modelPrice.PerRequestPrice != 0 {
 		if code != http.StatusOK {
-			return 0
+			return model.Amount{}
 		}
-		return float64(modelPrice.PerRequestPrice)
+
+		return model.Amount{
+			UsedAmount: float64(modelPrice.PerRequestPrice),
+		}
 	}
 
-	modelPrice = modelPrice.SelectConditionalPrice(usage)
+	modelPrice = modelPrice.SelectConditionalPriceWithOptions(usage, usageContext, options)
 
 	inputTokens := usage.InputTokens
 	if modelPrice.ImageInputPrice > 0 {
@@ -185,6 +268,10 @@ func CalculateAmount(
 
 	if modelPrice.AudioInputPrice > 0 {
 		inputTokens -= usage.AudioInputTokens
+	}
+
+	if modelPrice.VideoInputPrice > 0 {
+		inputTokens -= usage.VideoInputTokens
 	}
 
 	if modelPrice.CachedPrice > 0 {
@@ -198,6 +285,10 @@ func CalculateAmount(
 	outputTokens := usage.OutputTokens
 	if modelPrice.ImageOutputPrice > 0 {
 		outputTokens -= usage.ImageOutputTokens
+	}
+
+	if modelPrice.AudioOutputPrice > 0 {
+		outputTokens -= usage.AudioOutputTokens
 	}
 
 	outputPrice := float64(modelPrice.OutputPrice)
@@ -222,6 +313,10 @@ func CalculateAmount(
 		Mul(decimal.NewFromFloat(float64(modelPrice.AudioInputPrice))).
 		Div(decimal.NewFromInt(modelPrice.GetAudioInputPriceUnit()))
 
+	videoInputAmount := decimal.NewFromInt(int64(usage.VideoInputTokens)).
+		Mul(decimal.NewFromFloat(float64(modelPrice.VideoInputPrice))).
+		Div(decimal.NewFromInt(modelPrice.GetVideoInputPriceUnit()))
+
 	cachedAmount := decimal.NewFromInt(int64(usage.CachedTokens)).
 		Mul(decimal.NewFromFloat(float64(modelPrice.CachedPrice))).
 		Div(decimal.NewFromInt(modelPrice.GetCachedPriceUnit()))
@@ -242,15 +337,70 @@ func CalculateAmount(
 		Mul(decimal.NewFromFloat(float64(modelPrice.ImageOutputPrice))).
 		Div(decimal.NewFromInt(modelPrice.GetImageOutputPriceUnit()))
 
-	return inputAmount.
+	audioOutputAmount := decimal.NewFromInt(int64(usage.AudioOutputTokens)).
+		Mul(decimal.NewFromFloat(float64(modelPrice.AudioOutputPrice))).
+		Div(decimal.NewFromInt(modelPrice.GetAudioOutputPriceUnit()))
+
+	usedAmount := inputAmount.
 		Add(imageInputAmount).
 		Add(audioInputAmount).
+		Add(videoInputAmount).
 		Add(cachedAmount).
 		Add(cacheCreationAmount).
 		Add(webSearchAmount).
 		Add(outputAmount).
 		Add(imageOutputAmount).
+		Add(audioOutputAmount).
 		InexactFloat64()
+
+	return model.Amount{
+		InputAmount:         inputAmount.InexactFloat64(),
+		ImageInputAmount:    imageInputAmount.InexactFloat64(),
+		AudioInputAmount:    audioInputAmount.InexactFloat64(),
+		VideoInputAmount:    videoInputAmount.InexactFloat64(),
+		OutputAmount:        outputAmount.InexactFloat64(),
+		ImageOutputAmount:   imageOutputAmount.InexactFloat64(),
+		AudioOutputAmount:   audioOutputAmount.InexactFloat64(),
+		CachedAmount:        cachedAmount.InexactFloat64(),
+		CacheCreationAmount: cacheCreationAmount.InexactFloat64(),
+		WebSearchAmount:     webSearchAmount.InexactFloat64(),
+		UsedAmount:          usedAmount,
+	}
+}
+
+func CalculateAmount(
+	code int,
+	usage model.Usage,
+	usageContext model.UsageContext,
+	modelPrice model.Price,
+) float64 {
+	return CalculateAmountDetail(code, usage, usageContext, modelPrice).UsedAmount
+}
+
+func CalculateAmountWithOptions(
+	code int,
+	usage model.Usage,
+	usageContext model.UsageContext,
+	modelPrice model.Price,
+	options model.PriceSelectionOptions,
+) float64 {
+	return CalculateAmountDetailWithOptions(
+		code,
+		usage,
+		usageContext,
+		modelPrice,
+		options,
+	).UsedAmount
+}
+
+func priceSelectionOptions(meta *meta.Meta) model.PriceSelectionOptions {
+	if meta == nil {
+		return model.PriceSelectionOptions{}
+	}
+
+	return model.PriceSelectionOptions{
+		DisableResolutionFuzzyMatch: meta.ModelConfig.DisableResolutionFuzzyMatch,
+	}
 }
 
 func processGroupConsume(

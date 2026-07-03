@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/bytedance/sonic"
+	"github.com/bytedance/sonic/ast"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -102,16 +104,15 @@ func ConvertTTSRequest(meta *meta.Meta, req *http.Request) (adaptor.ConvertResul
 		return adaptor.ConvertResult{}, err
 	}
 
-	reqMap, err := utils.UnmarshalMap(req)
+	node, err := common.UnmarshalRequest2NodeReusable(req)
 	if err != nil {
 		return adaptor.ConvertResult{}, err
 	}
 
 	var sampleRate int
 
-	sampleRateI, ok := reqMap["sample_rate"].(float64)
-	if ok {
-		sampleRate = int(sampleRateI)
+	if sampleRateNode := node.Get("sample_rate"); sampleRateNode.Exists() {
+		sampleRate, _ = intFromTTSNode(sampleRateNode)
 	}
 
 	request.Model = meta.ActualModel
@@ -181,6 +182,33 @@ func ConvertTTSRequest(meta *meta.Meta, req *http.Request) (adaptor.ConvertResul
 	}, nil
 }
 
+func intFromTTSNode(node *ast.Node) (int, bool) {
+	if node == nil || !node.Exists() || node.TypeSafe() == ast.V_NULL {
+		return 0, false
+	}
+
+	if node.TypeSafe() == ast.V_STRING {
+		value, err := node.String()
+		if err != nil {
+			return 0, false
+		}
+
+		parsed, err := strconv.Atoi(strings.TrimSpace(value))
+		if err != nil {
+			return 0, false
+		}
+
+		return parsed, true
+	}
+
+	value, err := node.Int64()
+	if err != nil {
+		return 0, false
+	}
+
+	return int(value), true
+}
+
 func TTSDoRequest(meta *meta.Meta, req *http.Request) (*http.Response, error) {
 	wsURL := req.URL
 	wsURL.Scheme = "wss"
@@ -213,7 +241,7 @@ func TTSDoResponse(
 	meta *meta.Meta,
 	c *gin.Context,
 	_ *http.Response,
-) (usage model.Usage, err adaptor.Error) {
+) (adaptor.DoResponseResult, adaptor.Error) {
 	log := common.GetLogger(c)
 
 	conn, ok := meta.MustGet("ws_conn").(*websocket.Conn)
@@ -224,12 +252,12 @@ func TTSDoResponse(
 
 	sseFormat := meta.GetString("stream_format") == "sse"
 
-	usage = model.Usage{}
+	usage := model.Usage{}
 
 	for {
 		messageType, data, err := conn.ReadMessage()
 		if err != nil {
-			return usage, relaymodel.WrapperOpenAIErrorWithMessage(
+			return adaptor.DoResponseResult{Usage: usage}, relaymodel.WrapperOpenAIErrorWithMessage(
 				"ali_wss_read_msg_failed",
 				nil,
 				http.StatusInternalServerError,
@@ -241,11 +269,13 @@ func TTSDoResponse(
 		case websocket.TextMessage:
 			err = sonic.Unmarshal(data, &msg)
 			if err != nil {
-				return usage, relaymodel.WrapperOpenAIErrorWithMessage(
-					"ali_wss_read_msg_failed",
-					nil,
-					http.StatusInternalServerError,
-				)
+				return adaptor.DoResponseResult{
+						Usage: usage,
+					}, relaymodel.WrapperOpenAIErrorWithMessage(
+						"ali_wss_read_msg_failed",
+						nil,
+						http.StatusInternalServerError,
+					)
 			}
 
 			switch msg.Header.Event {
@@ -256,7 +286,7 @@ func TTSDoResponse(
 			case "task-finished":
 				usage.InputTokens = model.ZeroNullInt64(msg.Payload.Usage.Characters)
 				usage.TotalTokens = model.ZeroNullInt64(msg.Payload.Usage.Characters)
-				return usage, nil
+				return adaptor.DoResponseResult{Usage: usage}, nil
 			case "task-failed":
 				if sseFormat {
 					render.OpenaiAudioDone(c, relaymodel.TextToSpeechUsage{
@@ -265,14 +295,16 @@ func TTSDoResponse(
 						TotalTokens:  int64(usage.TotalTokens),
 					})
 
-					return usage, nil
+					return adaptor.DoResponseResult{Usage: usage}, nil
 				}
 
-				return usage, relaymodel.WrapperOpenAIErrorWithMessage(
-					msg.Header.ErrorMessage,
-					msg.Header.ErrorCode,
-					http.StatusInternalServerError,
-				)
+				return adaptor.DoResponseResult{
+						Usage: usage,
+					}, relaymodel.WrapperOpenAIErrorWithMessage(
+						msg.Header.ErrorMessage,
+						msg.Header.ErrorCode,
+						http.StatusInternalServerError,
+					)
 			}
 		case websocket.BinaryMessage:
 			if sseFormat {

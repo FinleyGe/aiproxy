@@ -18,13 +18,31 @@ import (
 )
 
 func ConvertClaudeRequest(meta *meta.Meta, req *http.Request) (adaptor.ConvertResult, error) {
-	adaptorConfig := Config{}
-
-	err := meta.ChannelConfigs.LoadConfig(&adaptorConfig)
+	cfg, err := loadConfig(meta)
 	if err != nil {
 		return adaptor.ConvertResult{}, err
 	}
 
+	return convertClaudeRequest(meta, req, cfg)
+}
+
+func (a *Adaptor) convertClaudeRequest(
+	meta *meta.Meta,
+	req *http.Request,
+) (adaptor.ConvertResult, error) {
+	cfg, err := a.loadConfig(meta)
+	if err != nil {
+		return adaptor.ConvertResult{}, err
+	}
+
+	return convertClaudeRequest(meta, req, cfg)
+}
+
+func convertClaudeRequest(
+	meta *meta.Meta,
+	req *http.Request,
+	adaptorConfig Config,
+) (adaptor.ConvertResult, error) {
 	textRequest, err := openai.ConvertClaudeRequestModel(meta, req)
 	if err != nil {
 		return adaptor.ConvertResult{}, err
@@ -33,12 +51,22 @@ func ConvertClaudeRequest(meta *meta.Meta, req *http.Request) (adaptor.ConvertRe
 	textRequest.Model = meta.ActualModel
 	meta.Set("stream", textRequest.Stream)
 
-	systemContent, contents, imageTasks := buildContents(textRequest)
+	disableAutoImageURLToBase64 := autoImageURLToBase64Disabled(meta, adaptorConfig)
+
+	systemContent, contents, imageTasks, _, _ := buildContents(
+		textRequest,
+		!disableAutoImageURLToBase64,
+		false,
+		false,
+	)
 
 	// Process image tasks concurrently
 	if len(imageTasks) > 0 {
-		if err := processImageTasks(req.Context(), imageTasks); err != nil {
-			return adaptor.ConvertResult{}, err
+		if err := processImageTasks(
+			req.Context(),
+			imageTasks,
+		); err != nil {
+			common.GetLoggerFromReq(req).Warnf("process gemini image tasks failed: %v", err)
 		}
 	}
 
@@ -73,9 +101,9 @@ func ClaudeHandler(
 	meta *meta.Meta,
 	c *gin.Context,
 	resp *http.Response,
-) (model.Usage, adaptor.Error) {
+) (adaptor.DoResponseResult, adaptor.Error) {
 	if resp.StatusCode != http.StatusOK {
-		return model.Usage{}, ErrorHandler(resp)
+		return adaptor.DoResponseResult{}, ErrorHandler(resp)
 	}
 
 	defer resp.Body.Close()
@@ -84,7 +112,7 @@ func ClaudeHandler(
 
 	err := sonic.ConfigDefault.NewDecoder(resp.Body).Decode(&geminiResponse)
 	if err != nil {
-		return model.Usage{}, relaymodel.WrapperAnthropicError(
+		return adaptor.DoResponseResult{}, relaymodel.WrapperAnthropicError(
 			err,
 			"unmarshal_response_body_failed",
 			http.StatusInternalServerError,
@@ -96,8 +124,8 @@ func ClaudeHandler(
 
 	jsonResponse, err := sonic.Marshal(claudeResponse)
 	if err != nil {
-		return claudeResponse.Usage.ToOpenAIUsage().
-				ToModelUsage(),
+		return adaptor.DoResponseResult{Usage: claudeResponse.Usage.ToOpenAIUsage().
+				ToModelUsage()},
 			relaymodel.WrapperAnthropicError(
 				err,
 				"marshal_response_body_failed",
@@ -112,7 +140,7 @@ func ClaudeHandler(
 	modelUsage := claudeResponse.Usage.ToOpenAIUsage().ToModelUsage()
 	modelUsage.WebSearchCount = model.ZeroNullInt64(geminiResponse.GetWebSearchCount())
 
-	return modelUsage, nil
+	return adaptor.DoResponseResult{Usage: modelUsage}, nil
 }
 
 // ClaudeStreamHandler handles streaming Gemini responses and converts them to Claude format
@@ -120,9 +148,9 @@ func ClaudeStreamHandler(
 	meta *meta.Meta,
 	c *gin.Context,
 	resp *http.Response,
-) (model.Usage, adaptor.Error) {
+) (adaptor.DoResponseResult, adaptor.Error) {
 	if resp.StatusCode != http.StatusOK {
-		return model.Usage{}, ErrorHandler(resp)
+		return adaptor.DoResponseResult{}, ErrorHandler(resp)
 	}
 
 	defer resp.Body.Close()
@@ -135,7 +163,9 @@ func ClaudeStreamHandler(
 	var (
 		messageID           = "msg_" + common.ShortUUID()
 		usage               model.Usage
-		webSearchCount      int64
+		webSearchQueries    = map[string]struct{}{}
+		webSearchGrounded   bool
+		webSearchGemini3    = isGemini3Meta(meta)
 		stopReason          string
 		currentContentIndex = -1
 		currentContentType  = ""
@@ -203,10 +233,13 @@ func ClaudeStreamHandler(
 		if geminiResponse.UsageMetadata != nil {
 			usage = geminiResponse.UsageMetadata.ToModelUsage()
 		}
-		// Track web search count from grounding metadata
-		if count := geminiResponse.GetWebSearchCount(); count > 0 {
-			webSearchCount += count
-		}
+
+		trackGeminiWebSearch(
+			&geminiResponse,
+			webSearchQueries,
+			&webSearchGrounded,
+			&webSearchGemini3,
+		)
 
 		// Process each candidate
 		for _, candidate := range geminiResponse.Candidates {
@@ -326,7 +359,9 @@ func ClaudeStreamHandler(
 	// Close the last open content block
 	closeCurrentBlock()
 
-	usage.WebSearchCount = model.ZeroNullInt64(webSearchCount)
+	usage.WebSearchCount = model.ZeroNullInt64(
+		geminiWebSearchCount(webSearchQueries, webSearchGrounded, webSearchGemini3),
+	)
 
 	claudeUsage := relaymodel.ClaudeFromModelUsage(usage)
 
@@ -348,7 +383,7 @@ func ClaudeStreamHandler(
 		Type: "message_stop",
 	})
 
-	return usage, nil
+	return adaptor.DoResponseResult{Usage: usage}, nil
 }
 
 // geminiResponse2Claude converts a Gemini response to Claude format
@@ -391,17 +426,23 @@ func geminiResponse2Claude(
 			} else if part.Text != "" {
 				if part.Thought {
 					// Add thinking content
-					claudeResponse.Content = append(claudeResponse.Content, relaymodel.ClaudeContent{
-						Type:      relaymodel.ClaudeContentTypeThinking,
-						Thinking:  part.Text,
-						Signature: part.ThoughtSignature,
-					})
+					claudeResponse.Content = append(
+						claudeResponse.Content,
+						relaymodel.ClaudeContent{
+							Type:      relaymodel.ClaudeContentTypeThinking,
+							Thinking:  part.Text,
+							Signature: part.ThoughtSignature,
+						},
+					)
 				} else {
 					// Add text content
-					claudeResponse.Content = append(claudeResponse.Content, relaymodel.ClaudeContent{
-						Type: relaymodel.ClaudeContentTypeText,
-						Text: part.Text,
-					})
+					claudeResponse.Content = append(
+						claudeResponse.Content,
+						relaymodel.ClaudeContent{
+							Type: relaymodel.ClaudeContentTypeText,
+							Text: part.Text,
+						},
+					)
 				}
 			}
 		}

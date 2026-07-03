@@ -3,7 +3,10 @@ package openai
 import (
 	"bytes"
 	"fmt"
+	"mime"
 	"net/http"
+	"net/url"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,8 +22,14 @@ import (
 	"github.com/labring/aiproxy/core/relay/utils"
 )
 
+type OpenAIRequestHook func(*relaymodel.GeneralOpenAIRequest) error
+
 // ConvertGeminiRequest converts a Gemini native request to OpenAI format
-func ConvertGeminiRequest(meta *meta.Meta, req *http.Request) (adaptor.ConvertResult, error) {
+func ConvertGeminiRequest(
+	meta *meta.Meta,
+	req *http.Request,
+	hooks ...OpenAIRequestHook,
+) (adaptor.ConvertResult, error) {
 	// Parse Gemini request
 	geminiReq, err := utils.UnmarshalGeminiChatRequest(req)
 	if err != nil {
@@ -66,13 +75,23 @@ func ConvertGeminiRequest(meta *meta.Meta, req *http.Request) (adaptor.ConvertRe
 	openaiReq.Messages = messages
 
 	// Convert generation config
-	convertGeminiGenerationConfigToOpenAI(geminiReq, &openaiReq)
+	convertGeminiGenerationConfigToOpenAI(meta, geminiReq, &openaiReq)
 
 	// Convert tools
 	openaiReq.Tools = convertGeminiToolsToOpenAI(geminiReq)
 
 	// Convert tool config
 	openaiReq.ToolChoice = convertGeminiToolConfigToOpenAI(geminiReq)
+
+	for _, hook := range hooks {
+		if hook == nil {
+			continue
+		}
+
+		if err := hook(&openaiReq); err != nil {
+			return adaptor.ConvertResult{}, err
+		}
+	}
 
 	// Marshal to JSON
 	data, err := sonic.Marshal(openaiReq)
@@ -95,7 +114,7 @@ func ConvertOpenAIToGeminiResponse(
 	openaiResp *relaymodel.TextResponse,
 ) *relaymodel.GeminiChatResponse {
 	geminiResp := &relaymodel.GeminiChatResponse{
-		ModelVersion: meta.ActualModel,
+		ModelVersion: responseModelName(meta),
 	}
 
 	if openaiResp.Usage.TotalTokens > 0 {
@@ -129,16 +148,22 @@ func ConvertOpenAIToGeminiResponse(
 			switch content := choice.Message.Content.(type) {
 			case string:
 				if content != "" {
-					candidate.Content.Parts = append(candidate.Content.Parts, &relaymodel.GeminiPart{
-						Text: content,
-					})
+					candidate.Content.Parts = append(
+						candidate.Content.Parts,
+						&relaymodel.GeminiPart{
+							Text: content,
+						},
+					)
 				}
 			case []relaymodel.MessageContent:
 				for _, part := range content {
 					if part.Type == relaymodel.ContentTypeText {
-						candidate.Content.Parts = append(candidate.Content.Parts, &relaymodel.GeminiPart{
-							Text: part.Text,
-						})
+						candidate.Content.Parts = append(
+							candidate.Content.Parts,
+							&relaymodel.GeminiPart{
+								Text: part.Text,
+							},
+						)
 					}
 				}
 			}
@@ -169,14 +194,14 @@ func GeminiStreamHandler(
 	meta *meta.Meta,
 	c *gin.Context,
 	resp *http.Response,
-) (model.Usage, adaptor.Error) {
+) (adaptor.DoResponseResult, adaptor.Error) {
 	if resp.StatusCode != http.StatusOK {
-		return model.Usage{}, ErrorHanlder(resp)
+		return adaptor.DoResponseResult{}, ErrorHanlder(resp)
 	}
 
 	defer resp.Body.Close()
 
-	scanner, cleanup := utils.NewStreamScanner(resp.Body, meta.ActualModel)
+	scanner, cleanup := utils.NewStreamScanner(resp.Body, meta.OriginModel, meta.ActualModel)
 	defer cleanup()
 
 	usage := model.Usage{}
@@ -209,7 +234,7 @@ func GeminiStreamHandler(
 		}
 	}
 
-	return usage, nil
+	return adaptor.DoResponseResult{Usage: usage}, nil
 }
 
 type GeminiStreamState struct {
@@ -232,7 +257,7 @@ func (s *GeminiStreamState) ConvertOpenAIStreamToGemini(
 	openaiResp *relaymodel.ChatCompletionsStreamResponse,
 ) *relaymodel.GeminiChatResponse {
 	geminiResp := &relaymodel.GeminiChatResponse{
-		ModelVersion: meta.ActualModel,
+		ModelVersion: responseModelName(meta),
 		Candidates:   []*relaymodel.GeminiChatCandidate{},
 	}
 
@@ -362,16 +387,16 @@ func GeminiHandler(
 	meta *meta.Meta,
 	c *gin.Context,
 	resp *http.Response,
-) (model.Usage, adaptor.Error) {
+) (adaptor.DoResponseResult, adaptor.Error) {
 	if resp.StatusCode != http.StatusOK {
-		return model.Usage{}, ErrorHanlder(resp)
+		return adaptor.DoResponseResult{}, ErrorHanlder(resp)
 	}
 
 	defer resp.Body.Close()
 
 	var openaiResp relaymodel.TextResponse
 	if err := sonic.ConfigDefault.NewDecoder(resp.Body).Decode(&openaiResp); err != nil {
-		return model.Usage{}, relaymodel.WrapperOpenAIError(
+		return adaptor.DoResponseResult{}, relaymodel.WrapperOpenAIError(
 			err,
 			"unmarshal_response_body_failed",
 			http.StatusInternalServerError,
@@ -382,18 +407,20 @@ func GeminiHandler(
 
 	jsonResponse, err := sonic.Marshal(geminiResp)
 	if err != nil {
-		return openaiResp.Usage.ToModelUsage(), relaymodel.WrapperOpenAIError(
-			err,
-			"marshal_response_body_failed",
-			http.StatusInternalServerError,
-		)
+		return adaptor.DoResponseResult{
+				Usage: openaiResp.Usage.ToModelUsage(),
+			}, relaymodel.WrapperOpenAIError(
+				err,
+				"marshal_response_body_failed",
+				http.StatusInternalServerError,
+			)
 	}
 
 	c.Writer.Header().Set("Content-Type", "application/json")
 	c.Writer.Header().Set("Content-Length", strconv.Itoa(len(jsonResponse)))
 	_, _ = c.Writer.Write(jsonResponse)
 
-	return openaiResp.Usage.ToModelUsage(), nil
+	return adaptor.DoResponseResult{Usage: openaiResp.Usage.ToModelUsage()}, nil
 }
 
 func convertGeminiSystemToOpenAI(geminiReq *relaymodel.GeminiChatRequest) []relaymodel.Message {
@@ -401,17 +428,17 @@ func convertGeminiSystemToOpenAI(geminiReq *relaymodel.GeminiChatRequest) []rela
 		return nil
 	}
 
-	systemText := ""
+	var systemText strings.Builder
 	for _, part := range geminiReq.SystemInstruction.Parts {
 		if part.Text != "" {
-			systemText += part.Text
+			systemText.WriteString(part.Text)
 		}
 	}
 
-	if systemText != "" {
+	if systemText.String() != "" {
 		return []relaymodel.Message{{
 			Role:    relaymodel.RoleSystem,
-			Content: systemText,
+			Content: systemText.String(),
 		}}
 	}
 
@@ -484,6 +511,7 @@ func convertGeminiToolConfigToOpenAI(geminiReq *relaymodel.GeminiChatRequest) an
 }
 
 func convertGeminiGenerationConfigToOpenAI(
+	meta *meta.Meta,
 	geminiReq *relaymodel.GeminiChatRequest,
 	openaiReq *relaymodel.GeneralOpenAIRequest,
 ) {
@@ -515,6 +543,12 @@ func convertGeminiGenerationConfigToOpenAI(
 				}
 			}
 		}
+
+		applyReasoningToOpenAIRequestForModel(
+			meta,
+			openaiReq,
+			utils.ParseGeminiReasoning(geminiReq.GenerationConfig.ThinkingConfig),
+		)
 	}
 }
 
@@ -654,19 +688,16 @@ func convertGeminiContentToOpenAI(
 			hasContent = true
 
 		case part.InlineData != nil:
-			// Handle image
-			imageURL := part.InlineData.Data
-			if !strings.HasPrefix(imageURL, "http") && !strings.HasPrefix(imageURL, "data:") {
-				// Base64 data
-				imageURL = "data:" + part.InlineData.MimeType + ";base64," + part.InlineData.Data
-			}
-
-			currentContentParts = append(currentContentParts, relaymodel.MessageContent{
-				Type: relaymodel.ContentTypeImageURL,
-				ImageURL: &relaymodel.ImageURL{
-					URL: imageURL,
-				},
-			})
+			currentContentParts = append(
+				currentContentParts,
+				convertGeminiInlineDataToOpenAIContent(part.InlineData),
+			)
+			hasContent = true
+		case part.FileData != nil:
+			currentContentParts = append(
+				currentContentParts,
+				convertGeminiFileDataToOpenAIContent(part.FileData),
+			)
 			hasContent = true
 		}
 	}
@@ -687,6 +718,96 @@ func convertGeminiContentToOpenAI(
 	}
 
 	return messages
+}
+
+func convertGeminiInlineDataToOpenAIContent(
+	inlineData *relaymodel.GeminiInlineData,
+) relaymodel.MessageContent {
+	dataURL := inlineData.Data
+	if !strings.HasPrefix(dataURL, "http") && !strings.HasPrefix(dataURL, "data:") {
+		dataURL = "data:" + inlineData.MimeType + ";base64," + inlineData.Data
+	}
+
+	switch {
+	case strings.HasPrefix(inlineData.MimeType, "audio/"):
+		return relaymodel.MessageContent{
+			Type: relaymodel.ContentTypeInputAudio,
+			InputAudio: &relaymodel.InputAudio{
+				URL: dataURL,
+			},
+		}
+	case strings.HasPrefix(inlineData.MimeType, "video/"):
+		return relaymodel.MessageContent{
+			Type: relaymodel.ContentTypeVideoURL,
+			VideoURL: &relaymodel.VideoURL{
+				URL: dataURL,
+			},
+		}
+	default:
+		return relaymodel.MessageContent{
+			Type: relaymodel.ContentTypeImageURL,
+			ImageURL: &relaymodel.ImageURL{
+				URL: dataURL,
+			},
+		}
+	}
+}
+
+func convertGeminiFileDataToOpenAIContent(
+	fileData *relaymodel.GeminiFileData,
+) relaymodel.MessageContent {
+	mimeType := fileData.MimeType
+	if mimeType == "" {
+		mimeType = inferGeminiFileDataMimeType(fileData.FileURI)
+	}
+
+	switch {
+	case strings.HasPrefix(mimeType, "audio/"):
+		return relaymodel.MessageContent{
+			Type: relaymodel.ContentTypeInputAudio,
+			InputAudio: &relaymodel.InputAudio{
+				URL: fileData.FileURI,
+			},
+		}
+	case strings.HasPrefix(mimeType, "video/"):
+		return relaymodel.MessageContent{
+			Type: relaymodel.ContentTypeVideoURL,
+			VideoURL: &relaymodel.VideoURL{
+				URL: fileData.FileURI,
+			},
+		}
+	default:
+		return relaymodel.MessageContent{
+			Type: relaymodel.ContentTypeImageURL,
+			ImageURL: &relaymodel.ImageURL{
+				URL: fileData.FileURI,
+			},
+		}
+	}
+}
+
+func inferGeminiFileDataMimeType(fileURI string) string {
+	if after, ok := strings.CutPrefix(fileURI, "data:"); ok {
+		mediaType := after
+		if beforeParams, _, ok := strings.Cut(mediaType, ";"); ok {
+			return beforeParams
+		}
+
+		if beforeData, _, ok := strings.Cut(mediaType, ","); ok {
+			return beforeData
+		}
+	}
+
+	path := fileURI
+	if parsed, err := url.Parse(fileURI); err == nil && parsed.Path != "" {
+		path = parsed.Path
+	}
+
+	if ext := filepath.Ext(path); ext != "" {
+		return mime.TypeByExtension(strings.ToLower(ext))
+	}
+
+	return ""
 }
 
 // ConvertGeminiToResponsesRequest converts a Gemini request to Responses API format
@@ -749,6 +870,14 @@ func ConvertGeminiToResponsesRequest(
 		}
 	}
 
+	if geminiReq.GenerationConfig != nil {
+		applyReasoningToResponsesRequestForModel(
+			meta,
+			&responsesReq,
+			utils.ParseGeminiReasoning(geminiReq.GenerationConfig.ThinkingConfig),
+		)
+	}
+
 	// Convert tools
 	if len(geminiReq.Tools) > 0 {
 		var tools []relaymodel.ResponseTool
@@ -803,8 +932,6 @@ func ConvertGeminiToResponsesRequest(
 		return adaptor.ConvertResult{}, err
 	}
 
-	fmt.Println(string(jsonData))
-
 	return adaptor.ConvertResult{
 		Header: http.Header{
 			"Content-Type":   {"application/json"},
@@ -819,16 +946,16 @@ func ConvertResponsesToGeminiResponse(
 	meta *meta.Meta,
 	c *gin.Context,
 	resp *http.Response,
-) (model.Usage, adaptor.Error) {
+) (adaptor.DoResponseResult, adaptor.Error) {
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return model.Usage{}, ErrorHanlder(resp)
+		return adaptor.DoResponseResult{}, ErrorHanlder(resp)
 	}
 
 	defer resp.Body.Close()
 
 	responseBody, err := common.GetResponseBody(resp)
 	if err != nil {
-		return model.Usage{}, relaymodel.WrapperOpenAIError(
+		return adaptor.DoResponseResult{}, relaymodel.WrapperOpenAIError(
 			err,
 			"read_response_body_failed",
 			http.StatusInternalServerError,
@@ -839,7 +966,7 @@ func ConvertResponsesToGeminiResponse(
 
 	err = sonic.Unmarshal(responseBody, &responsesResp)
 	if err != nil {
-		return model.Usage{}, relaymodel.WrapperOpenAIError(
+		return adaptor.DoResponseResult{}, relaymodel.WrapperOpenAIError(
 			err,
 			"unmarshal_response_body_failed",
 			http.StatusInternalServerError,
@@ -848,7 +975,7 @@ func ConvertResponsesToGeminiResponse(
 
 	// Convert to Gemini format
 	geminiResp := relaymodel.GeminiChatResponse{
-		ModelVersion: responsesResp.Model,
+		ModelVersion: responseModelName(meta),
 		Candidates:   []*relaymodel.GeminiChatCandidate{},
 	}
 
@@ -883,7 +1010,7 @@ func ConvertResponsesToGeminiResponse(
 			if outputItem.Name != "" {
 				var args map[string]any
 				if outputItem.Arguments != "" {
-					err := sonic.Unmarshal([]byte(outputItem.Arguments), &args)
+					err := sonic.UnmarshalString(outputItem.Arguments.String(), &args)
 					if err == nil {
 						candidate.Content.Parts = append(
 							candidate.Content.Parts,
@@ -928,11 +1055,8 @@ func ConvertResponsesToGeminiResponse(
 		}
 	}
 
-	usage := model.Usage{}
-
 	// Convert usage
 	if responsesResp.Usage != nil {
-		usage = responsesResp.Usage.ToModelUsage()
 		geminiUsage := responsesResp.Usage.ToGeminiUsage()
 		geminiResp.UsageMetadata = &geminiUsage
 	}
@@ -940,7 +1064,7 @@ func ConvertResponsesToGeminiResponse(
 	// Marshal and return
 	geminiRespData, err := sonic.Marshal(geminiResp)
 	if err != nil {
-		return model.Usage{}, relaymodel.WrapperOpenAIError(
+		return adaptor.DoResponseResult{}, relaymodel.WrapperOpenAIError(
 			err,
 			"marshal_response_body_failed",
 			http.StatusInternalServerError,
@@ -951,7 +1075,11 @@ func ConvertResponsesToGeminiResponse(
 	c.Writer.Header().Set("Content-Length", strconv.Itoa(len(geminiRespData)))
 	_, _ = c.Writer.Write(geminiRespData)
 
-	return usage, nil
+	return adaptor.DoResponseResult{
+		Usage:      responsesResp.ToModelUsage(),
+		UpstreamID: responsesResp.ID,
+		AsyncUsage: responseNeedsAsyncUsage(&responsesResp),
+	}, nil
 }
 
 // ConvertResponsesToGeminiStreamResponse converts Responses API stream to Gemini stream
@@ -959,35 +1087,37 @@ func ConvertResponsesToGeminiStreamResponse(
 	meta *meta.Meta,
 	c *gin.Context,
 	resp *http.Response,
-) (model.Usage, adaptor.Error) {
+) (adaptor.DoResponseResult, adaptor.Error) {
 	if resp.StatusCode != http.StatusOK {
-		return model.Usage{}, ErrorHanlder(resp)
+		return adaptor.DoResponseResult{}, ErrorHanlder(resp)
 	}
 
 	defer resp.Body.Close()
 
 	log := common.GetLogger(c)
 
-	scanner, cleanup := utils.NewStreamScanner(resp.Body, meta.ActualModel)
+	scanner, cleanup := utils.NewStreamScanner(resp.Body, meta.OriginModel, meta.ActualModel)
 	defer cleanup()
 
-	var usage model.Usage
+	var (
+		errorState  responsesStreamErrorState
+		wroteStream bool
+	)
 
 	state := &geminiStreamState{
 		meta: meta,
 		c:    c,
 	}
 
-	for scanner.Scan() {
+	stopStream := false
+
+	for scanner.Scan() && !stopStream {
 		data := scanner.Bytes()
 		if !render.IsValidSSEData(data) {
 			continue
 		}
 
 		data = render.ExtractSSEData(data)
-		if render.IsSSEDone(data) {
-			break
-		}
 
 		// Parse the stream event
 		var event relaymodel.ResponseStreamEvent
@@ -998,6 +1128,35 @@ func ConvertResponsesToGeminiStreamResponse(
 			continue
 		}
 
+		errorState.update(&event)
+
+		if err := errorState.errorBeforeEvent(&event); err != nil {
+			return errorState.result(), err
+		}
+
+		if event.Type == relaymodel.EventResponseFailed || event.Type == relaymodel.EventError {
+			if wroteStream {
+				log.Error(
+					"response stream failed after data was sent: " + responseStreamErrorMessage(
+						&event,
+					),
+				)
+
+				stopStream = true
+
+				continue
+			}
+
+			err, handled := errorState.handleFailure(&event)
+			if handled && err == nil {
+				continue
+			}
+
+			if handled {
+				return errorState.result(), err
+			}
+		}
+
 		// Handle events
 		// Note: Gemini format requires complete JSON for function calls,
 		// so we handle function_call_arguments.done (complete), not function_call_arguments.delta (streaming)
@@ -1005,15 +1164,17 @@ func ConvertResponsesToGeminiStreamResponse(
 		case relaymodel.EventOutputItemAdded:
 			state.handleOutputItemAdded(&event)
 		case relaymodel.EventOutputTextDelta:
-			state.handleOutputTextDelta(&event)
-		case relaymodel.EventFunctionCallArgumentsDone:
-			state.handleFunctionCallArgumentsDone(&event)
-		case relaymodel.EventResponseCompleted, relaymodel.EventResponseDone:
-			if event.Response != nil && event.Response.Usage != nil {
-				usage = event.Response.Usage.ToModelUsage()
+			if state.handleOutputTextDelta(&event) {
+				wroteStream = true
 			}
-
-			state.handleResponseCompleted(&event)
+		case relaymodel.EventFunctionCallArgumentsDone:
+			if state.handleFunctionCallArgumentsDone(&event) {
+				wroteStream = true
+			}
+		case relaymodel.EventResponseCompleted, relaymodel.EventResponseDone:
+			if state.handleResponseCompleted(&event) {
+				wroteStream = true
+			}
 		}
 	}
 
@@ -1021,7 +1182,11 @@ func ConvertResponsesToGeminiStreamResponse(
 		log.Error("error reading response stream: " + err.Error())
 	}
 
-	return usage, nil
+	if errorState.pendingFailure != nil && !wroteStream {
+		return errorState.result(), responseStreamError(errorState.pendingFailure)
+	}
+
+	return errorState.result(), nil
 }
 
 // geminiStreamState manages state for Gemini stream conversion
@@ -1048,14 +1213,14 @@ func (s *geminiStreamState) handleOutputItemAdded(event *relaymodel.ResponseStre
 }
 
 // handleOutputTextDelta handles response.output_text.delta event for Gemini
-func (s *geminiStreamState) handleOutputTextDelta(event *relaymodel.ResponseStreamEvent) {
+func (s *geminiStreamState) handleOutputTextDelta(event *relaymodel.ResponseStreamEvent) bool {
 	if event.Delta == "" {
-		return
+		return false
 	}
 
 	// Send text delta
 	geminiResp := relaymodel.GeminiChatResponse{
-		ModelVersion: s.meta.ActualModel,
+		ModelVersion: responseModelName(s.meta),
 		Candidates: []*relaymodel.GeminiChatCandidate{
 			{
 				Index: 0,
@@ -1072,29 +1237,33 @@ func (s *geminiStreamState) handleOutputTextDelta(event *relaymodel.ResponseStre
 	}
 
 	_ = render.GeminiObjectData(s.c, geminiResp)
+
+	return true
 }
 
 // handleFunctionCallArgumentsDone handles response.function_call_arguments.done event for Gemini
-func (s *geminiStreamState) handleFunctionCallArgumentsDone(event *relaymodel.ResponseStreamEvent) {
+func (s *geminiStreamState) handleFunctionCallArgumentsDone(
+	event *relaymodel.ResponseStreamEvent,
+) bool {
 	if event.Arguments == "" || event.ItemID == "" {
-		return
+		return false
 	}
 
 	// Get function name from tracked state
 	functionName := s.functionCallNames[event.ItemID]
 	if functionName == "" {
-		return
+		return false
 	}
 
 	// Parse arguments
 	var args map[string]any
-	if err := sonic.UnmarshalString(event.Arguments, &args); err != nil {
-		return
+	if err := sonic.UnmarshalString(event.Arguments.String(), &args); err != nil {
+		return false
 	}
 
 	// Send complete function call
 	geminiResp := relaymodel.GeminiChatResponse{
-		ModelVersion: s.meta.ActualModel,
+		ModelVersion: responseModelName(s.meta),
 		Candidates: []*relaymodel.GeminiChatCandidate{
 			{
 				Index: 0,
@@ -1114,18 +1283,20 @@ func (s *geminiStreamState) handleFunctionCallArgumentsDone(event *relaymodel.Re
 	}
 
 	_ = render.GeminiObjectData(s.c, geminiResp)
+
+	return true
 }
 
 // handleResponseCompleted handles response.completed/done event for Gemini
-func (s *geminiStreamState) handleResponseCompleted(event *relaymodel.ResponseStreamEvent) {
+func (s *geminiStreamState) handleResponseCompleted(event *relaymodel.ResponseStreamEvent) bool {
 	if event.Response == nil || event.Response.Usage == nil {
-		return
+		return false
 	}
 
 	// Send final response with usage
 	geminiUsage := event.Response.Usage.ToGeminiUsage()
 	geminiResp := relaymodel.GeminiChatResponse{
-		ModelVersion:  s.meta.ActualModel,
+		ModelVersion:  responseModelName(s.meta),
 		UsageMetadata: &geminiUsage,
 		Candidates: []*relaymodel.GeminiChatCandidate{
 			{
@@ -1140,4 +1311,6 @@ func (s *geminiStreamState) handleResponseCompleted(event *relaymodel.ResponseSt
 	}
 
 	_ = render.GeminiObjectData(s.c, geminiResp)
+
+	return true
 }

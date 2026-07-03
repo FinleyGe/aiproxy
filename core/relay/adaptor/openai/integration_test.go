@@ -2,6 +2,7 @@ package openai_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -31,14 +32,14 @@ func TestIntegrationChatCompletionToResponsesFlow(t *testing.T) {
 			{Role: "system", Content: "You are a helpful assistant."},
 			{Role: "user", Content: "What is 2+2?"},
 		},
-		Temperature: floatPtr(0.7),
+		Temperature: new(0.7),
 		MaxTokens:   100,
 	}
 
 	reqBody, err := json.Marshal(chatReq)
 	require.NoError(t, err)
 
-	httpReq := httptest.NewRequest(
+	httpReq, _ := http.NewRequestWithContext(context.Background(),
 		http.MethodPost,
 		"/v1/chat/completions",
 		bytes.NewReader(reqBody),
@@ -122,8 +123,8 @@ func TestIntegrationChatCompletionToResponsesFlow(t *testing.T) {
 	assert.Equal(t, "gpt-5-codex", finalResp.Model)
 	assert.NotEmpty(t, finalResp.Choices)
 	assert.Contains(t, finalResp.Choices[0].Message.Content, "2 + 2 equals 4")
-	assert.Equal(t, int64(25), int64(usage.InputTokens))
-	assert.Equal(t, int64(10), int64(usage.OutputTokens))
+	assert.Equal(t, int64(25), int64(usage.Usage.InputTokens))
+	assert.Equal(t, int64(10), int64(usage.Usage.OutputTokens))
 }
 
 // TestIntegrationModelDetection tests that IsResponsesOnlyModel correctly
@@ -204,6 +205,12 @@ func TestIntegrationGetRequestURL(t *testing.T) {
 			mode:        mode.Gemini,
 			expectedURL: "/responses",
 		},
+		{
+			name:        "sora-2 with Videos mode should use /videos",
+			model:       "sora-2",
+			mode:        mode.Videos,
+			expectedURL: "/videos",
+		},
 	}
 
 	for _, tt := range tests {
@@ -266,7 +273,7 @@ func TestIntegrationConvertRequestWithDifferentModes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			httpReq := httptest.NewRequest(
+			httpReq, _ := http.NewRequestWithContext(context.Background(),
 				http.MethodPost,
 				"/test",
 				bytes.NewReader([]byte(tt.requestBody)),

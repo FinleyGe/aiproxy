@@ -2,7 +2,6 @@ package anthropic
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -13,13 +12,13 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/labring/aiproxy/core/common"
 	"github.com/labring/aiproxy/core/common/image"
-	"github.com/labring/aiproxy/core/model"
 	"github.com/labring/aiproxy/core/relay/adaptor"
 	"github.com/labring/aiproxy/core/relay/adaptor/openai"
 	"github.com/labring/aiproxy/core/relay/meta"
 	relaymodel "github.com/labring/aiproxy/core/relay/model"
 	"github.com/labring/aiproxy/core/relay/render"
 	"github.com/labring/aiproxy/core/relay/utils"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -44,8 +43,23 @@ func stopReasonClaude2OpenAI(reason string) string {
 	}
 }
 
-//nolint:gocyclo
 func OpenAIConvertRequest(meta *meta.Meta, req *http.Request) (*relaymodel.ClaudeRequest, error) {
+	adaptorConfig, err := loadConfig(meta)
+	if err != nil {
+		return nil, err
+	}
+
+	return openAIConvertRequest(meta, req, adaptorConfig)
+}
+
+//nolint:gocyclo
+func openAIConvertRequest(
+	meta *meta.Meta,
+	req *http.Request,
+	adaptorConfig Config,
+) (*relaymodel.ClaudeRequest, error) {
+	resolvedModel := ResolveModelName(meta.OriginModel, meta.ActualModel)
+
 	var textRequest relaymodel.ClaudeOpenAIRequest
 
 	err := common.UnmarshalRequestReusable(req, &textRequest)
@@ -53,10 +67,7 @@ func OpenAIConvertRequest(meta *meta.Meta, req *http.Request) (*relaymodel.Claud
 		return nil, err
 	}
 
-	onlyThinking, err := utils.UnmarshalGeneralThinking(req)
-	if err != nil {
-		return nil, err
-	}
+	reasoning := utils.ParseClaudeOpenAIReasoning(&textRequest)
 
 	textRequest.Model = meta.ActualModel
 	claudeTools := make([]relaymodel.ClaudeTool, 0, len(textRequest.Tools))
@@ -113,24 +124,55 @@ func OpenAIConvertRequest(meta *meta.Meta, req *http.Request) (*relaymodel.Claud
 	}
 
 	if claudeRequest.MaxTokens == 0 {
-		claudeRequest.MaxTokens = ModelDefaultMaxTokens(meta.ActualModel)
+		claudeRequest.MaxTokens = ModelDefaultMaxTokens(resolvedModel)
 	}
 
-	if onlyThinking.Thinking != nil {
-		claudeRequest.Thinking = onlyThinking.Thinking
-		if claudeRequest.Thinking.Type == "disabled" {
+	if reasoning.Specified {
+		utils.ApplyReasoningToClaudeRequest(
+			resolvedModel,
+			&claudeRequest.MaxTokens,
+			&claudeRequest.Thinking,
+			&claudeRequest.OutputConfig,
+			reasoning,
+		)
+
+		if claudeRequest.Thinking != nil && claudeRequest.Thinking.Type == "disabled" {
 			claudeRequest.Thinking = nil
+			claudeRequest.OutputConfig = nil
 		}
-	} else if strings.Contains(meta.OriginModel, "think") {
+	} else if utils.FirstMatchingModelName(
+		func(modelName string) bool {
+			return strings.Contains(strings.ToLower(modelName), "think")
+		},
+		meta.OriginModel,
+		meta.ActualModel,
+	) != "" {
+		thinkingType := relaymodel.ClaudeThinkingTypeEnabled
+		if shouldAutoUseAdaptiveThinking(resolvedModel) {
+			thinkingType = relaymodel.ClaudeThinkingTypeAdaptive
+		}
+
 		claudeRequest.Thinking = &relaymodel.ClaudeThinking{
-			Type: "enabled",
+			Type: thinkingType,
 		}
 	}
 
 	if claudeRequest.Thinking != nil {
-		adjustThinkingBudgetTokens(&claudeRequest.MaxTokens, &claudeRequest.Thinking.BudgetTokens)
+		normalizeClaudeThinking(
+			resolvedModel,
+			&claudeRequest.MaxTokens,
+			&claudeRequest.Thinking,
+			&claudeRequest.OutputConfig,
+		)
+	}
 
+	if claudeRequest.Thinking != nil {
 		claudeRequest.Temperature = nil
+	}
+
+	if claudeRequest.Temperature != nil && claudeRequest.TopP != nil {
+		// Claude does not allow both temperature and top_p to be specified
+		claudeRequest.TopP = nil
 	}
 
 	if len(claudeTools) > 0 {
@@ -152,6 +194,8 @@ func OpenAIConvertRequest(meta *meta.Meta, req *http.Request) (*relaymodel.Claud
 
 		claudeRequest.ToolChoice = claudeToolChoice
 	}
+
+	disableAutoImageURLToBase64 := autoImageURLToBase64Disabled(meta, adaptorConfig)
 
 	var imageTasks []*relaymodel.ClaudeContent
 
@@ -196,7 +240,8 @@ func OpenAIConvertRequest(meta *meta.Meta, req *http.Request) (*relaymodel.Claud
 
 			openaiContent := message.ParseContent()
 			for _, part := range openaiContent {
-				if message.Role == relaymodel.RoleAssistant && part.Text == "" && len(message.ToolCalls) > 0 {
+				if message.Role == relaymodel.RoleAssistant && part.Text == "" &&
+					len(message.ToolCalls) > 0 {
 					continue
 				}
 
@@ -207,11 +252,14 @@ func OpenAIConvertRequest(meta *meta.Meta, req *http.Request) (*relaymodel.Claud
 					content.Text = part.Text
 				case relaymodel.ContentTypeImageURL:
 					content.Type = relaymodel.ClaudeContentTypeImage
+
 					content.Source = &relaymodel.ClaudeImageSource{
 						Type: relaymodel.ClaudeImageSourceTypeURL,
 						URL:  part.ImageURL.URL,
 					}
-					imageTasks = append(imageTasks, &content)
+					if !disableAutoImageURLToBase64 {
+						imageTasks = append(imageTasks, &content)
+					}
 				}
 
 				contents = append(contents, content)
@@ -236,10 +284,7 @@ func OpenAIConvertRequest(meta *meta.Meta, req *http.Request) (*relaymodel.Claud
 	}
 
 	if len(imageTasks) > 0 {
-		err := batchPatchImage2Base64(req.Context(), imageTasks)
-		if err != nil {
-			return nil, err
-		}
+		batchPatchImage2Base64(req.Context(), imageTasks)
 	}
 
 	if hasToolCalls {
@@ -249,14 +294,10 @@ func OpenAIConvertRequest(meta *meta.Meta, req *http.Request) (*relaymodel.Claud
 	return &claudeRequest, nil
 }
 
-func batchPatchImage2Base64(ctx context.Context, imageTasks []*relaymodel.ClaudeContent) error {
+func batchPatchImage2Base64(ctx context.Context, imageTasks []*relaymodel.ClaudeContent) {
 	sem := semaphore.NewWeighted(3)
 
-	var (
-		wg          sync.WaitGroup
-		mu          sync.Mutex
-		processErrs []error
-	)
+	var wg sync.WaitGroup
 
 	for _, task := range imageTasks {
 		if task.Source.URL == "" {
@@ -264,16 +305,22 @@ func batchPatchImage2Base64(ctx context.Context, imageTasks []*relaymodel.Claude
 		}
 
 		wg.Go(func() {
-			_ = sem.Acquire(ctx, 1)
+			if err := sem.Acquire(ctx, 1); err != nil {
+				log.Warnf(
+					"convert anthropic image url to base64 skipped, keep original url: %v",
+					err,
+				)
+
+				return
+			}
 			defer sem.Release(1)
 
 			mimeType, data, err := image.GetImageFromURL(ctx, task.Source.URL)
 			if err != nil {
-				mu.Lock()
-
-				processErrs = append(processErrs, err)
-
-				mu.Unlock()
+				log.Warnf(
+					"convert anthropic image url to base64 failed, keep original url: %v",
+					err,
+				)
 
 				return
 			}
@@ -286,12 +333,6 @@ func batchPatchImage2Base64(ctx context.Context, imageTasks []*relaymodel.Claude
 	}
 
 	wg.Wait()
-
-	if len(processErrs) != 0 {
-		return errors.Join(processErrs...)
-	}
-
-	return nil
 }
 
 // StreamState maintains state during streaming response conversion
@@ -339,6 +380,7 @@ func (s *StreamState) StreamResponse2OpenAI(
 		thinking   string
 		signature  string
 		stopReason string
+		upstreamID string
 	)
 
 	tools := make([]relaymodel.ToolCall, 0)
@@ -404,6 +446,7 @@ func (s *StreamState) StreamResponse2OpenAI(
 
 		openAIUsage := claudeResponse.Message.Usage.ToOpenAIUsage()
 		usage = &openAIUsage
+		upstreamID = claudeResponse.Message.ID
 	case "message_delta":
 		if claudeResponse.Usage != nil {
 			openAIUsage := claudeResponse.Usage.ToOpenAIUsage()
@@ -427,8 +470,14 @@ func (s *StreamState) StreamResponse2OpenAI(
 		FinishReason: stopReasonClaude2OpenAI(stopReason),
 	}
 
+	// Use upstream ID if available, otherwise generate a new one
+	responseID := upstreamID
+	if responseID == "" {
+		responseID = openai.ChatCompletionID()
+	}
+
 	openaiResponse := relaymodel.ChatCompletionsStreamResponse{
-		ID:      openai.ChatCompletionID(),
+		ID:      responseID,
 		Object:  relaymodel.ChatCompletionChunkObject,
 		Created: time.Now().Unix(),
 		Model:   meta.OriginModel,
@@ -505,8 +554,14 @@ func Response2OpenAI(
 		FinishReason: stopReasonClaude2OpenAI(claudeResponse.StopReason),
 	}
 
+	// Use upstream ID if available, otherwise generate a new one
+	responseID := claudeResponse.ID
+	if responseID == "" {
+		responseID = openai.ChatCompletionID()
+	}
+
 	fullTextResponse := relaymodel.TextResponse{
-		ID:      openai.ChatCompletionID(),
+		ID:      responseID,
 		Model:   meta.OriginModel,
 		Object:  relaymodel.ChatCompletionObject,
 		Created: time.Now().Unix(),
@@ -526,9 +581,9 @@ func OpenAIStreamHandler(
 	m *meta.Meta,
 	c *gin.Context,
 	resp *http.Response,
-) (model.Usage, adaptor.Error) {
+) (adaptor.DoResponseResult, adaptor.Error) {
 	if resp.StatusCode != http.StatusOK {
-		return model.Usage{}, OpenAIErrorHandler(resp)
+		return adaptor.DoResponseResult{}, OpenAIErrorHandler(resp)
 	}
 
 	defer resp.Body.Close()
@@ -541,8 +596,9 @@ func OpenAIStreamHandler(
 	responseText := strings.Builder{}
 
 	var (
-		usage  *relaymodel.ChatUsage
-		writed bool
+		usage      *relaymodel.ChatUsage
+		writed     bool
+		upstreamID string
 	)
 
 	streamState := NewStreamState()
@@ -570,30 +626,34 @@ func OpenAIStreamHandler(
 			}
 
 			if response != nil && response.Usage != nil {
-				usage.Add(response.Usage)
+				usage = response.Usage
+			} else if usage.PromptTokens == 0 || usage.TotalTokens == 0 {
+				complateTokens := openai.CountTokenText(
+					responseText.String(),
+					m.OriginModel,
+				)
+				usage = &relaymodel.ChatUsage{
+					PromptTokens:     int64(m.RequestUsage.InputTokens),
+					CompletionTokens: complateTokens,
+					TotalTokens:      int64(m.RequestUsage.InputTokens) + complateTokens,
+				}
 			}
 
-			return usage.ToModelUsage(), err
+			return adaptor.DoResponseResult{Usage: usage.ToModelUsage()}, err
 		}
 
 		if response == nil {
 			continue
 		}
 
+		// Capture upstream ID from response ID
+		if response.ID != "" && upstreamID == "" {
+			upstreamID = response.ID
+		}
+
 		switch {
 		case response.Usage != nil:
-			if usage == nil {
-				usage = &relaymodel.ChatUsage{}
-			}
-
-			usage.Add(response.Usage)
-
-			if usage.PromptTokens == 0 {
-				usage.PromptTokens = int64(m.RequestUsage.InputTokens)
-				usage.TotalTokens += int64(m.RequestUsage.InputTokens)
-			}
-
-			response.Usage = usage
+			usage = response.Usage
 
 			responseText.Reset()
 		case usage == nil:
@@ -635,23 +695,26 @@ func OpenAIStreamHandler(
 
 	render.OpenaiDone(c)
 
-	return usage.ToModelUsage(), nil
+	return adaptor.DoResponseResult{
+		Usage:      usage.ToModelUsage(),
+		UpstreamID: upstreamID,
+	}, nil
 }
 
 func OpenAIHandler(
 	meta *meta.Meta,
 	c *gin.Context,
 	resp *http.Response,
-) (model.Usage, adaptor.Error) {
+) (adaptor.DoResponseResult, adaptor.Error) {
 	if resp.StatusCode != http.StatusOK {
-		return model.Usage{}, OpenAIErrorHandler(resp)
+		return adaptor.DoResponseResult{}, OpenAIErrorHandler(resp)
 	}
 
 	defer resp.Body.Close()
 
 	body, err := common.GetResponseBody(resp)
 	if err != nil {
-		return model.Usage{}, relaymodel.WrapperOpenAIError(
+		return adaptor.DoResponseResult{}, relaymodel.WrapperOpenAIError(
 			err,
 			"read_response_body_failed",
 			http.StatusInternalServerError,
@@ -660,12 +723,12 @@ func OpenAIHandler(
 
 	fullTextResponse, adaptorErr := Response2OpenAI(meta, body)
 	if adaptorErr != nil {
-		return model.Usage{}, adaptorErr
+		return adaptor.DoResponseResult{}, adaptorErr
 	}
 
 	jsonResponse, err := sonic.Marshal(fullTextResponse)
 	if err != nil {
-		return model.Usage{}, relaymodel.WrapperOpenAIError(
+		return adaptor.DoResponseResult{}, relaymodel.WrapperOpenAIError(
 			err,
 			"marshal_response_body_failed",
 			http.StatusInternalServerError,
@@ -676,5 +739,8 @@ func OpenAIHandler(
 	c.Writer.Header().Set("Content-Length", strconv.Itoa(len(jsonResponse)))
 	_, _ = c.Writer.Write(jsonResponse)
 
-	return fullTextResponse.Usage.ToModelUsage(), nil
+	return adaptor.DoResponseResult{
+		Usage:      fullTextResponse.Usage.ToModelUsage(),
+		UpstreamID: fullTextResponse.ID,
+	}, nil
 }

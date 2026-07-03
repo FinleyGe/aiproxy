@@ -1,17 +1,180 @@
 package openai_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/labring/aiproxy/core/relay/adaptor/openai"
 	"github.com/labring/aiproxy/core/relay/meta"
 	relaymodel "github.com/labring/aiproxy/core/relay/model"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func TestConvertGeminiRequest_MapsThinkingConfigToReasoningEffort(t *testing.T) {
+	tests := []struct {
+		name           string
+		actualModel    string
+		requestJSON    string
+		expectedEffort string
+	}{
+		{
+			name:        "thinking level maps directly",
+			actualModel: "gpt-5",
+			requestJSON: `{
+				"generationConfig": {
+					"thinkingConfig": {
+						"thinkingLevel": "high"
+					}
+				},
+				"contents": [{"role":"user","parts":[{"text":"hello"}]}]
+			}`,
+			expectedEffort: "high",
+		},
+		{
+			name:        "thinking budget maps to effort",
+			actualModel: "gpt-5",
+			requestJSON: `{
+				"generationConfig": {
+					"thinkingConfig": {
+						"thinkingBudget": 2048,
+						"includeThoughts": true
+					}
+				},
+				"contents": [{"role":"user","parts":[{"text":"hello"}]}]
+			}`,
+			expectedEffort: "low",
+		},
+		{
+			name:        "gpt-5.5 does not receive minimal",
+			actualModel: "gpt-5.5",
+			requestJSON: `{
+				"generationConfig": {
+					"thinkingConfig": {
+						"thinkingBudget": 512,
+						"includeThoughts": true
+					}
+				},
+				"contents": [{"role":"user","parts":[{"text":"hello"}]}]
+			}`,
+			expectedEffort: "low",
+		},
+		{
+			name:        "gpt-5.4 mini snapshot does not receive minimal",
+			actualModel: "gpt-5.4-mini-2026-03-17",
+			requestJSON: `{
+				"generationConfig": {
+					"thinkingConfig": {
+						"thinkingBudget": 512,
+						"includeThoughts": true
+					}
+				},
+				"contents": [{"role":"user","parts":[{"text":"hello"}]}]
+			}`,
+			expectedEffort: "low",
+		},
+		{
+			name:        "gpt-5 does not receive xhigh",
+			actualModel: "gpt-5",
+			requestJSON: `{
+				"generationConfig": {
+					"thinkingConfig": {
+						"thinkingBudget": 32768,
+						"includeThoughts": true
+					}
+				},
+				"contents": [{"role":"user","parts":[{"text":"hello"}]}]
+			}`,
+			expectedEffort: "high",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequestWithContext(
+				context.Background(),
+				http.MethodPost,
+				"/v1beta/models/gemini-pro:generateContent",
+				strings.NewReader(tt.requestJSON),
+			)
+			if err != nil {
+				t.Fatalf("failed to create request: %v", err)
+			}
+
+			meta := &meta.Meta{ActualModel: tt.actualModel}
+
+			result, err := openai.ConvertGeminiRequest(meta, req)
+			if err != nil {
+				t.Fatalf("ConvertGeminiRequest failed: %v", err)
+			}
+
+			bodyBytes, _ := io.ReadAll(result.Body)
+
+			var openAIReq relaymodel.GeneralOpenAIRequest
+			if err := json.Unmarshal(bodyBytes, &openAIReq); err != nil {
+				t.Fatalf("failed to unmarshal result body: %v", err)
+			}
+
+			if openAIReq.ReasoningEffort == nil {
+				t.Fatal("expected reasoning_effort to be set")
+			}
+
+			if *openAIReq.ReasoningEffort != tt.expectedEffort {
+				t.Fatalf(
+					"expected reasoning_effort %s, got %s",
+					tt.expectedEffort,
+					*openAIReq.ReasoningEffort,
+				)
+			}
+		})
+	}
+}
+
+func TestConvertResponsesToGeminiStreamResponseReturnsErrorAfterUnwrittenFunctionCall(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+
+	stream := strings.Join([]string{
+		`data: {"type":"response.function_call_arguments.done","item_id":"fc_missing","arguments":"{\"query\":\"hello\"}"}`,
+		"",
+		`event: error`,
+		`data: {"type":"error","error":{"type":"server_error","code":"server_error","message":"stream failed"}}`,
+		"",
+	}, "\n")
+
+	httpResp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(bytes.NewReader([]byte(stream))),
+		Header:     make(http.Header),
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodPost,
+		"/v1beta/models/gemini-pro:streamGenerateContent",
+		nil,
+	)
+
+	m := &meta.Meta{
+		ActualModel: "gpt-5",
+	}
+
+	result, err := openai.ConvertResponsesToGeminiStreamResponse(m, c, httpResp)
+	require.NotNil(t, err)
+	assert.Equal(t, http.StatusBadGateway, err.StatusCode())
+	assert.Empty(t, result.UpstreamID)
+	assert.Empty(t, w.Body.String())
+}
 
 func TestConvertGeminiRequest_ToolResponse(t *testing.T) {
 	// Reproduce the user's scenario:
@@ -689,7 +852,10 @@ func TestConvertGeminiRequest_ToolsWithRequiredField(t *testing.T) {
 						t.Errorf("required field should be removed when it's null")
 					}
 				} else {
-					t.Errorf("Parameters should be a map, got %T", openAIReq.Tools[0].Function.Parameters)
+					t.Errorf(
+						"Parameters should be a map, got %T",
+						openAIReq.Tools[0].Function.Parameters,
+					)
 				}
 			},
 		},

@@ -4,19 +4,37 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 
 	"github.com/bytedance/sonic/ast"
 	"github.com/gin-gonic/gin"
 	"github.com/labring/aiproxy/core/common"
-	"github.com/labring/aiproxy/core/model"
+	coremodel "github.com/labring/aiproxy/core/model"
 	"github.com/labring/aiproxy/core/relay/adaptor"
 	"github.com/labring/aiproxy/core/relay/adaptor/openai"
 	"github.com/labring/aiproxy/core/relay/meta"
 	relaymodel "github.com/labring/aiproxy/core/relay/model"
 	"github.com/labring/aiproxy/core/relay/utils"
 )
+
+func aliModelMatches(meta *meta.Meta, match func(string) bool) bool {
+	if meta == nil {
+		return false
+	}
+	return utils.FirstMatchingModelName(match, meta.OriginModel, meta.ActualModel) != ""
+}
+
+func isAliQwen3Model(meta *meta.Meta) bool {
+	return aliModelMatches(meta, func(modelName string) bool {
+		return strings.HasPrefix(strings.ToLower(modelName), "qwen3-")
+	})
+}
+
+func isAliQwqModel(meta *meta.Meta) bool {
+	return aliModelMatches(meta, func(modelName string) bool {
+		return strings.HasPrefix(strings.ToLower(modelName), "qwq-")
+	})
+}
 
 // qwen3 enable_thinking must be set to false for non-streaming calls
 func patchQwen3EnableThinking(node *ast.Node) error {
@@ -48,45 +66,13 @@ func patchQwqOnlySupportStream(node *ast.Node) error {
 }
 
 // https://help.aliyun.com/zh/model-studio/deep-thinking
-func patchGeneralThinkingFromNode(node *ast.Node) error {
-	request, err := utils.UnmarshalGeneralThinkingFromNode(node)
+func patchReasoningFromNode(meta *meta.Meta, node *ast.Node) error {
+	reasoning, err := utils.ParseOpenAIReasoningFromNode(node)
 	if err != nil {
 		return err
 	}
 
-	if request.Thinking == nil {
-		return nil
-	}
-
-	switch request.Thinking.Type {
-	case relaymodel.ClaudeThinkingTypeEnabled:
-		_, err := node.Set("enable_thinking", ast.NewBool(true))
-		if err != nil {
-			return err
-		}
-
-		if request.Thinking.BudgetTokens > 0 {
-			_, err = node.Set(
-				"thinking_budget",
-				ast.NewNumber(strconv.Itoa(request.Thinking.BudgetTokens)),
-			)
-			if err != nil {
-				return err
-			}
-		}
-	case relaymodel.ClaudeThinkingTypeDisabled:
-		_, err := node.Set("enable_thinking", ast.NewBool(false))
-		if err != nil {
-			return err
-		}
-
-		_, err = node.Unset("thinking_budget")
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return utils.ApplyReasoningToAliNode(meta.OriginModel, meta.ActualModel, node, reasoning)
 }
 
 func ConvertCompletionsRequest(
@@ -95,13 +81,15 @@ func ConvertCompletionsRequest(
 	req *http.Request,
 ) (adaptor.ConvertResult, error) {
 	callbacks := []func(node *ast.Node) error{
-		patchGeneralThinkingFromNode,
+		func(node *ast.Node) error {
+			return patchReasoningFromNode(meta, node)
+		},
 	}
-	if strings.HasPrefix(meta.ActualModel, "qwen3-") {
+	if isAliQwen3Model(meta) {
 		callbacks = append(callbacks, patchQwen3EnableThinking)
 	}
 
-	if strings.HasPrefix(meta.ActualModel, "qwq-") {
+	if isAliQwqModel(meta) {
 		callbacks = append(callbacks, patchQwqOnlySupportStream)
 	}
 
@@ -114,17 +102,59 @@ func ConvertChatCompletionsRequest(
 	req *http.Request,
 ) (adaptor.ConvertResult, error) {
 	callbacks := []func(node *ast.Node) error{
-		patchGeneralThinkingFromNode,
+		func(node *ast.Node) error {
+			return patchReasoningFromNode(meta, node)
+		},
 	}
-	if strings.HasPrefix(meta.ActualModel, "qwen3-") {
+	if isAliQwen3Model(meta) {
 		callbacks = append(callbacks, patchQwen3EnableThinking)
 	}
 
-	if strings.HasPrefix(meta.ActualModel, "qwq-") {
+	if isAliQwqModel(meta) {
 		callbacks = append(callbacks, patchQwqOnlySupportStream)
 	}
 
 	return openai.ConvertChatCompletionsRequest(meta, req, false, callbacks...)
+}
+
+func ConvertGeminiRequest(
+	meta *meta.Meta,
+	req *http.Request,
+) (adaptor.ConvertResult, error) {
+	hooks := []openai.OpenAIRequestHook{
+		func(openAIReq *relaymodel.GeneralOpenAIRequest) error {
+			reasoning := utils.ParseOpenAIReasoning(openAIReq)
+			utils.ApplyReasoningToAliRequest(
+				meta.OriginModel,
+				meta.ActualModel,
+				openAIReq,
+				reasoning,
+			)
+
+			return nil
+		},
+	}
+
+	if isAliQwen3Model(meta) {
+		hooks = append(hooks, func(openAIReq *relaymodel.GeneralOpenAIRequest) error {
+			if !openAIReq.Stream {
+				enableThinking := false
+				openAIReq.EnableThinking = &enableThinking
+				openAIReq.ThinkingBudget = nil
+			}
+
+			return nil
+		})
+	}
+
+	if isAliQwqModel(meta) {
+		hooks = append(hooks, func(openAIReq *relaymodel.GeneralOpenAIRequest) error {
+			openAIReq.Stream = true
+			return nil
+		})
+	}
+
+	return openai.ConvertGeminiRequest(meta, req, hooks...)
 }
 
 func getEnableSearch(node *ast.Node) bool {
@@ -137,28 +167,185 @@ func ChatHandler(
 	store adaptor.Store,
 	c *gin.Context,
 	resp *http.Response,
-) (model.Usage, adaptor.Error) {
+) (adaptor.DoResponseResult, adaptor.Error) {
 	if resp.StatusCode != http.StatusOK {
-		return model.Usage{}, ErrorHanlder(resp)
+		return adaptor.DoResponseResult{}, ErrorHanlder(resp)
 	}
 
 	node, err := common.UnmarshalRequest2NodeReusable(c.Request)
 	if err != nil {
-		return model.Usage{}, relaymodel.WrapperOpenAIErrorWithMessage(
+		return adaptor.DoResponseResult{}, relaymodel.WrapperOpenAIErrorWithMessage(
 			fmt.Sprintf("get request body failed: %s", err),
 			"get_request_body_failed",
 			http.StatusInternalServerError,
 		)
 	}
 
-	u, e := openai.DoResponse(meta, store, c, resp)
+	result, e := openai.DoResponse(meta, store, c, resp)
 	if e != nil {
-		return model.Usage{}, e
+		return adaptor.DoResponseResult{}, e
 	}
 
 	if getEnableSearch(&node) {
-		u.WebSearchCount++
+		result.Usage.WebSearchCount++
 	}
 
-	return u, nil
+	result.UsageContext = aliChatUsageContextWithDefaults(
+		aliChatUsageContext(result.Usage).
+			WithFallback(aliChatRequestUsageContext(&node)).
+			WithFallback(result.UsageContext),
+	)
+
+	return result, nil
+}
+
+func aliChatUsageContext(usage coremodel.Usage) coremodel.UsageContext {
+	usageContext := coremodel.UsageContext{}
+
+	if usage.ImageInputTokens > 0 || usage.AudioInputTokens > 0 || usage.VideoInputTokens > 0 {
+		usageContext.InputMedia = new(bool)
+		*usageContext.InputMedia = true
+	}
+
+	if usage.VideoInputTokens > 0 {
+		usageContext.InputVideo = new(bool)
+		*usageContext.InputVideo = true
+	}
+
+	if usage.AudioOutputTokens > 0 {
+		usageContext.OutputAudio = new(bool)
+		*usageContext.OutputAudio = true
+	}
+
+	return usageContext
+}
+
+func aliChatRequestUsageContext(node *ast.Node) coremodel.UsageContext {
+	usageContext := coremodel.UsageContext{}
+
+	if aliChatRequestHasInputMedia(node) {
+		usageContext.InputMedia = new(bool)
+		*usageContext.InputMedia = true
+	}
+
+	if aliChatRequestHasInputVideo(node) {
+		usageContext.InputVideo = new(bool)
+		*usageContext.InputVideo = true
+	}
+
+	if aliChatRequestWantsOutputAudio(node) {
+		usageContext.OutputAudio = new(bool)
+		*usageContext.OutputAudio = true
+	}
+
+	return usageContext
+}
+
+func aliChatUsageContextWithDefaults(usageContext coremodel.UsageContext) coremodel.UsageContext {
+	if usageContext.InputMedia == nil {
+		usageContext.InputMedia = new(bool)
+	}
+
+	if usageContext.OutputAudio == nil {
+		usageContext.OutputAudio = new(bool)
+	}
+
+	return usageContext
+}
+
+func aliChatRequestHasInputMedia(node *ast.Node) bool {
+	return aliChatRequestContentMatches(node, func(content *ast.Node) bool {
+		return aliChatContentHasField(content, "image_url") ||
+			aliChatContentHasField(content, "input_audio") ||
+			aliChatContentHasField(content, "audio") ||
+			aliChatContentHasField(content, "video") ||
+			aliChatContentHasField(content, "video_url") ||
+			aliChatContentTypeContains(content, "image") ||
+			aliChatContentTypeContains(content, "audio") ||
+			aliChatContentTypeContains(content, "video")
+	})
+}
+
+func aliChatRequestHasInputVideo(node *ast.Node) bool {
+	return aliChatRequestContentMatches(node, func(content *ast.Node) bool {
+		return aliChatContentHasField(content, "video") ||
+			aliChatContentHasField(content, "video_url") ||
+			aliChatContentTypeContains(content, "video")
+	})
+}
+
+func aliChatRequestWantsOutputAudio(node *ast.Node) bool {
+	modalities := node.Get("modalities")
+	if modalities.Exists() && modalities.TypeSafe() == ast.V_ARRAY {
+		hasAudio := false
+		_ = modalities.ForEach(func(_ ast.Sequence, item *ast.Node) bool {
+			value, err := item.String()
+			if err == nil && strings.EqualFold(value, "audio") {
+				hasAudio = true
+				return false
+			}
+
+			return true
+		})
+
+		if hasAudio {
+			return true
+		}
+	}
+
+	return node.Get("audio").Exists()
+}
+
+func aliChatRequestContentMatches(node *ast.Node, match func(*ast.Node) bool) bool {
+	messages := node.Get("messages")
+	if !messages.Exists() || messages.TypeSafe() != ast.V_ARRAY {
+		return false
+	}
+
+	matched := false
+	_ = messages.ForEach(func(_ ast.Sequence, message *ast.Node) bool {
+		content := message.Get("content")
+		if !content.Exists() {
+			return true
+		}
+
+		if content.TypeSafe() == ast.V_ARRAY {
+			_ = content.ForEach(func(_ ast.Sequence, item *ast.Node) bool {
+				if match(item) {
+					matched = true
+					return false
+				}
+
+				return true
+			})
+
+			return !matched
+		}
+
+		if match(content) {
+			matched = true
+			return false
+		}
+
+		return true
+	})
+
+	return matched
+}
+
+func aliChatContentHasField(content *ast.Node, field string) bool {
+	return content.TypeSafe() == ast.V_OBJECT && content.Get(field).Exists()
+}
+
+func aliChatContentTypeContains(content *ast.Node, pattern string) bool {
+	if content.TypeSafe() != ast.V_OBJECT {
+		return false
+	}
+
+	contentType, err := content.Get("type").String()
+	if err != nil {
+		return false
+	}
+
+	return strings.Contains(strings.ToLower(contentType), pattern)
 }

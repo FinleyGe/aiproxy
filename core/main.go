@@ -84,6 +84,16 @@ func main() {
 
 	go task.UsageAlertTask(ctx)
 
+	log.Info("async usage poll task started")
+
+	go task.AsyncUsagePollTask(ctx)
+
+	if common.RedisEnabled {
+		log.Info("redis health check task started")
+
+		go task.RedisHealthCheckTask(ctx)
+	}
+
 	log.Info("update channels balance task started")
 
 	go controller.UpdateChannelsBalance(time.Minute * 10)

@@ -1,8 +1,16 @@
 package azure_test
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"strings"
 	"testing"
 
+	"github.com/labring/aiproxy/core/model"
 	"github.com/labring/aiproxy/core/relay/adaptor/azure"
 	"github.com/labring/aiproxy/core/relay/adaptor/openai"
 	"github.com/labring/aiproxy/core/relay/meta"
@@ -205,32 +213,50 @@ func TestGetRequestURL_OtherModes(t *testing.T) {
 	tests := []struct {
 		name            string
 		mode            mode.Mode
+		expectedMethod  string
 		expectedContain string
 	}{
 		{
 			name:            "Completions mode",
 			mode:            mode.Completions,
+			expectedMethod:  http.MethodPost,
 			expectedContain: "/completions",
 		},
 		{
 			name:            "Embeddings mode",
 			mode:            mode.Embeddings,
+			expectedMethod:  http.MethodPost,
 			expectedContain: "/embeddings",
 		},
 		{
 			name:            "ImagesGenerations mode",
 			mode:            mode.ImagesGenerations,
+			expectedMethod:  http.MethodPost,
 			expectedContain: "/images/generations",
+		},
+		{
+			name:            "ImagesEdits mode",
+			mode:            mode.ImagesEdits,
+			expectedMethod:  http.MethodPost,
+			expectedContain: "/images/edits",
 		},
 		{
 			name:            "AudioTranscription mode",
 			mode:            mode.AudioTranscription,
+			expectedMethod:  http.MethodPost,
 			expectedContain: "/audio/transcriptions",
 		},
 		{
 			name:            "AudioSpeech mode",
 			mode:            mode.AudioSpeech,
+			expectedMethod:  http.MethodPost,
 			expectedContain: "/audio/speech",
+		},
+		{
+			name:            "Videos mode",
+			mode:            mode.Videos,
+			expectedMethod:  http.MethodPost,
+			expectedContain: "/openai/v1/videos",
 		},
 	}
 
@@ -246,6 +272,123 @@ func TestGetRequestURL_OtherModes(t *testing.T) {
 			result, err := adaptor.GetRequestURL(meta, nil, nil)
 			require.NoError(t, err)
 
+			assert.Equal(t, tt.expectedMethod, result.Method)
+			assert.Contains(t, result.URL, tt.expectedContain)
+		})
+	}
+}
+
+func TestGetRequestURL_Videos(t *testing.T) {
+	adaptor := &azure.Adaptor{}
+
+	tests := []struct {
+		name            string
+		mode            mode.Mode
+		videoID         string
+		expectedMethod  string
+		expectedContain string
+	}{
+		{
+			name:            "create video",
+			mode:            mode.Videos,
+			expectedMethod:  http.MethodPost,
+			expectedContain: "/openai/v1/videos?api-version=preview",
+		},
+		{
+			name:            "get video",
+			mode:            mode.VideosGet,
+			videoID:         "video_123",
+			expectedMethod:  http.MethodGet,
+			expectedContain: "/openai/v1/videos/video_123?api-version=preview",
+		},
+		{
+			name:            "get video content",
+			mode:            mode.VideosContent,
+			videoID:         "video_123",
+			expectedMethod:  http.MethodGet,
+			expectedContain: "/openai/v1/videos/video_123/content?api-version=preview",
+		},
+		{
+			name:            "delete video",
+			mode:            mode.VideosDelete,
+			videoID:         "video_123",
+			expectedMethod:  http.MethodDelete,
+			expectedContain: "/openai/v1/videos/video_123?api-version=preview",
+		},
+		{
+			name:            "remix video",
+			mode:            mode.VideosRemix,
+			videoID:         "video_123",
+			expectedMethod:  http.MethodPost,
+			expectedContain: "/openai/v1/videos/video_123/remix?api-version=preview",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			meta := &meta.Meta{
+				ActualModel: "sora",
+				Mode:        tt.mode,
+				VideoID:     tt.videoID,
+			}
+			meta.Channel.BaseURL = "https://test.openai.azure.com"
+			meta.Channel.Key = "test-key|2024-02-01"
+
+			result, err := adaptor.GetRequestURL(meta, nil, nil)
+			require.NoError(t, err)
+			assert.Equal(t, tt.expectedMethod, result.Method)
+			assert.Contains(t, result.URL, tt.expectedContain)
+		})
+	}
+}
+
+func TestGetRequestURL_VideoGenerationsJobs(t *testing.T) {
+	adaptor := &azure.Adaptor{}
+
+	tests := []struct {
+		name            string
+		mode            mode.Mode
+		jobID           string
+		generationID    string
+		expectedMethod  string
+		expectedContain string
+	}{
+		{
+			name:            "create video generation job",
+			mode:            mode.VideoGenerationsJobs,
+			expectedMethod:  http.MethodPost,
+			expectedContain: "/openai/v1/video/generations/jobs?api-version=2024-02-01",
+		},
+		{
+			name:            "get video generation job",
+			mode:            mode.VideoGenerationsGetJobs,
+			jobID:           "job_123",
+			expectedMethod:  http.MethodGet,
+			expectedContain: "/openai/v1/video/generations/jobs/job_123?api-version=2024-02-01",
+		},
+		{
+			name:            "get video generation content",
+			mode:            mode.VideoGenerationsContent,
+			generationID:    "gen_123",
+			expectedMethod:  http.MethodGet,
+			expectedContain: "/openai/v1/video/generations/gen_123/content/video?api-version=2024-02-01",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			meta := &meta.Meta{
+				ActualModel:  "sora",
+				Mode:         tt.mode,
+				JobID:        tt.jobID,
+				GenerationID: tt.generationID,
+			}
+			meta.Channel.BaseURL = "https://test.openai.azure.com"
+			meta.Channel.Key = "test-key|2024-02-01"
+
+			result, err := adaptor.GetRequestURL(meta, nil, nil)
+			require.NoError(t, err)
+			assert.Equal(t, tt.expectedMethod, result.Method)
 			assert.Contains(t, result.URL, tt.expectedContain)
 		})
 	}
@@ -270,4 +413,132 @@ func TestGetRequestURL_ResponsesModeDirect(t *testing.T) {
 	// Should use preview API version for Responses mode
 	assert.Contains(t, result.URL, "api-version=preview")
 	assert.Equal(t, "POST", result.Method)
+}
+
+func TestConvertRequest_ImagesGenerationsRemovesModel(t *testing.T) {
+	adaptor := &azure.Adaptor{}
+	meta := meta.NewMeta(nil, mode.ImagesGenerations, "dall-e-3", model.ModelConfig{})
+
+	body := `{"model":"dall-e-3","prompt":"test prompt","size":"1024x1024","response_format":"b64_json"}`
+	req, err := http.NewRequestWithContext(
+		context.Background(),
+		http.MethodPost,
+		"http://example.com/v1/images/generations",
+		strings.NewReader(body),
+	)
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+
+	result, err := adaptor.ConvertRequest(meta, nil, req)
+	require.NoError(t, err)
+
+	convertedBody, err := io.ReadAll(result.Body)
+	require.NoError(t, err)
+
+	var payload map[string]any
+
+	err = json.Unmarshal(convertedBody, &payload)
+	require.NoError(t, err)
+
+	_, ok := payload["model"]
+	assert.False(t, ok)
+	assert.Equal(t, "test prompt", payload["prompt"])
+	assert.Equal(t, "application/json", result.Header.Get("Content-Type"))
+	assert.Equal(t, "b64_json", meta.GetString(openai.MetaResponseFormat))
+}
+
+func TestConvertRequest_ImagesEditsRemovesModel(t *testing.T) {
+	adaptor := &azure.Adaptor{}
+	meta := meta.NewMeta(nil, mode.ImagesEdits, "gpt-image-1", model.ModelConfig{})
+
+	var body bytes.Buffer
+
+	writer := multipart.NewWriter(&body)
+	require.NoError(t, writer.WriteField("model", "gpt-image-1"))
+	require.NoError(t, writer.WriteField("prompt", "edit prompt"))
+	require.NoError(t, writer.WriteField("response_format", "b64_json"))
+
+	part, err := writer.CreateFormFile("image", "test.png")
+	require.NoError(t, err)
+	_, err = part.Write([]byte("png-bytes"))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	req, err := http.NewRequestWithContext(
+		context.Background(),
+		http.MethodPost,
+		"http://example.com/v1/images/edits",
+		bytes.NewReader(body.Bytes()),
+	)
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.ContentLength = int64(body.Len())
+
+	result, err := adaptor.ConvertRequest(meta, nil, req)
+	require.NoError(t, err)
+
+	convertedBody, err := io.ReadAll(result.Body)
+	require.NoError(t, err)
+
+	contentType := result.Header.Get("Content-Type")
+	assert.NotEmpty(t, contentType)
+
+	convertedReq, err := http.NewRequestWithContext(
+		context.Background(),
+		http.MethodPost,
+		"http://example.com",
+		bytes.NewReader(convertedBody),
+	)
+	require.NoError(t, err)
+	convertedReq.Header.Set("Content-Type", contentType)
+	convertedReq.ContentLength = int64(len(convertedBody))
+
+	err = convertedReq.ParseMultipartForm(1024 * 1024 * 4)
+	require.NoError(t, err)
+
+	assert.Equal(t, "edit prompt", convertedReq.MultipartForm.Value["prompt"][0])
+	assert.Nil(t, convertedReq.MultipartForm.Value["model"])
+	assert.Equal(t, "b64_json", convertedReq.MultipartForm.Value["response_format"][0])
+
+	files := convertedReq.MultipartForm.File["image"]
+	require.Len(t, files, 1)
+	file, err := files[0].Open()
+	require.NoError(t, err)
+
+	defer file.Close()
+
+	fileContent, err := io.ReadAll(file)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("png-bytes"), fileContent)
+}
+
+func TestConvertRequest_ImagesGenerationsDotReplacementUsesAzureDeploymentWithoutModelField(
+	t *testing.T,
+) {
+	adaptor := &azure.Adaptor{}
+	meta := meta.NewMeta(nil, mode.ImagesGenerations, "gpt-image-1.0", model.ModelConfig{})
+
+	body := `{"model":"ignored","prompt":"test"}`
+	req, err := http.NewRequestWithContext(
+		context.Background(),
+		http.MethodPost,
+		"http://example.com/v1/images/generations",
+		strings.NewReader(body),
+	)
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+
+	result, err := adaptor.ConvertRequest(meta, nil, req)
+	require.NoError(t, err)
+
+	convertedBody, err := io.ReadAll(result.Body)
+	require.NoError(t, err)
+
+	var payload map[string]any
+
+	err = json.Unmarshal(convertedBody, &payload)
+	require.NoError(t, err)
+
+	_, ok := payload["model"]
+	assert.False(t, ok)
 }

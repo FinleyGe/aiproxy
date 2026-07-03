@@ -47,6 +47,8 @@ func ConvertGeminiRequestToStruct(
 	meta *meta.Meta,
 	req *http.Request,
 ) (*relaymodel.ClaudeRequest, error) {
+	resolvedModel := ResolveModelName(meta.OriginModel, meta.ActualModel)
+
 	// Parse Gemini request
 	geminiReq, err := utils.UnmarshalGeminiChatRequest(req)
 	if err != nil {
@@ -56,7 +58,7 @@ func ConvertGeminiRequestToStruct(
 	// Convert to Claude format
 	claudeReq := relaymodel.ClaudeRequest{
 		Model:     meta.ActualModel,
-		MaxTokens: ModelDefaultMaxTokens(meta.ActualModel),
+		MaxTokens: ModelDefaultMaxTokens(resolvedModel),
 		Messages:  []relaymodel.ClaudeMessage{},
 		System:    convertGeminiSystemInstruction(geminiReq),
 	}
@@ -90,13 +92,42 @@ func ConvertGeminiRequestToStruct(
 	if geminiReq.GenerationConfig != nil {
 		if geminiReq.GenerationConfig.Temperature != nil {
 			claudeReq.Temperature = geminiReq.GenerationConfig.Temperature
-		} else if geminiReq.GenerationConfig.TopP != nil {
+		}
+
+		if geminiReq.GenerationConfig.TopP != nil {
 			claudeReq.TopP = geminiReq.GenerationConfig.TopP
+		}
+
+		if claudeReq.Temperature != nil && claudeReq.TopP != nil {
+			// Claude does not allow both temperature and top_p to be specified
+			claudeReq.TopP = nil
 		}
 
 		if geminiReq.GenerationConfig.MaxOutputTokens != nil {
 			claudeReq.MaxTokens = *geminiReq.GenerationConfig.MaxOutputTokens
 		}
+	}
+
+	reasoning := utils.ParseGeminiReasoning(nil)
+	if geminiReq.GenerationConfig != nil {
+		reasoning = utils.ParseGeminiReasoning(geminiReq.GenerationConfig.ThinkingConfig)
+	}
+
+	utils.ApplyReasoningToClaudeRequest(
+		resolvedModel,
+		&claudeReq.MaxTokens,
+		&claudeReq.Thinking,
+		&claudeReq.OutputConfig,
+		reasoning,
+	)
+
+	if claudeReq.Thinking != nil {
+		normalizeClaudeThinking(
+			resolvedModel,
+			&claudeReq.MaxTokens,
+			&claudeReq.Thinking,
+			&claudeReq.OutputConfig,
+		)
 	}
 
 	// Convert tools
@@ -184,16 +215,16 @@ func GeminiHandler(
 	meta *meta.Meta,
 	c *gin.Context,
 	resp *http.Response,
-) (model.Usage, adaptor.Error) {
+) (adaptor.DoResponseResult, adaptor.Error) {
 	if resp.StatusCode != http.StatusOK {
-		return model.Usage{}, ErrorHandler(resp)
+		return adaptor.DoResponseResult{}, ErrorHandler(resp)
 	}
 
 	defer resp.Body.Close()
 
 	var claudeResp relaymodel.ClaudeResponse
 	if err := sonic.ConfigDefault.NewDecoder(resp.Body).Decode(&claudeResp); err != nil {
-		return model.Usage{}, relaymodel.WrapperAnthropicError(
+		return adaptor.DoResponseResult{}, relaymodel.WrapperAnthropicError(
 			err,
 			"unmarshal_response_body_failed",
 			http.StatusInternalServerError,
@@ -204,11 +235,13 @@ func GeminiHandler(
 
 	jsonResponse, err := sonic.Marshal(geminiResp)
 	if err != nil {
-		return claudeResp.Usage.ToOpenAIUsage().ToModelUsage(), relaymodel.WrapperAnthropicError(
-			err,
-			"marshal_response_body_failed",
-			http.StatusInternalServerError,
-		)
+		return adaptor.DoResponseResult{
+				Usage: claudeResp.Usage.ToOpenAIUsage().ToModelUsage(),
+			}, relaymodel.WrapperAnthropicError(
+				err,
+				"marshal_response_body_failed",
+				http.StatusInternalServerError,
+			)
 	}
 
 	c.Writer.Header().Set("Content-Type", "application/json")
@@ -216,7 +249,10 @@ func GeminiHandler(
 
 	_, _ = c.Writer.Write(jsonResponse)
 
-	return claudeResp.Usage.ToOpenAIUsage().ToModelUsage(), nil
+	return adaptor.DoResponseResult{
+		Usage:      claudeResp.Usage.ToOpenAIUsage().ToModelUsage(),
+		UpstreamID: claudeResp.ID,
+	}, nil
 }
 
 // GeminiStreamHandler handles streaming responses and converts them to Gemini format
@@ -224,9 +260,9 @@ func GeminiStreamHandler(
 	meta *meta.Meta,
 	c *gin.Context,
 	resp *http.Response,
-) (model.Usage, adaptor.Error) {
+) (adaptor.DoResponseResult, adaptor.Error) {
 	if resp.StatusCode != http.StatusOK {
-		return model.Usage{}, ErrorHandler(resp)
+		return adaptor.DoResponseResult{}, ErrorHandler(resp)
 	}
 
 	defer resp.Body.Close()
@@ -237,6 +273,7 @@ func GeminiStreamHandler(
 	defer cleanup()
 
 	usage := model.Usage{}
+	upstreamID := ""
 
 	streamState := NewGeminiStreamState()
 
@@ -257,6 +294,10 @@ func GeminiStreamHandler(
 			continue
 		}
 
+		if claudeResp.Message != nil && claudeResp.Message.ID != "" && upstreamID == "" {
+			upstreamID = claudeResp.Message.ID
+		}
+
 		// Convert to Gemini stream format
 		geminiResp := streamState.ConvertClaudeStreamToGemini(
 			meta,
@@ -275,7 +316,10 @@ func GeminiStreamHandler(
 		log.Error("error reading stream: " + err.Error())
 	}
 
-	return usage, nil
+	return adaptor.DoResponseResult{
+		Usage:      usage,
+		UpstreamID: upstreamID,
+	}, nil
 }
 
 // GeminiStreamState maintains state during streaming response conversion
@@ -489,7 +533,11 @@ func convertGeminiContent(
 				// Orphaned result - convert to text to avoid validation error
 				msg.Content = append(msg.Content, relaymodel.ClaudeContent{
 					Type: relaymodel.ClaudeContentTypeText,
-					Text: fmt.Sprintf("Tool result for %s: %s", part.FunctionResponse.Name, content),
+					Text: fmt.Sprintf(
+						"Tool result for %s: %s",
+						part.FunctionResponse.Name,
+						content,
+					),
 				})
 			}
 		case part.Text != "":

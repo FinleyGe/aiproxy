@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/labring/aiproxy/core/model"
 	"github.com/labring/aiproxy/core/relay/adaptor"
+	"github.com/labring/aiproxy/core/relay/adaptor/registry"
 	"github.com/labring/aiproxy/core/relay/meta"
 	"github.com/labring/aiproxy/core/relay/mode"
 	"github.com/labring/aiproxy/core/relay/utils"
@@ -18,13 +19,19 @@ import (
 
 type Adaptor struct{}
 
+func init() {
+	registry.Register(model.ChannelTypeCohere, &Adaptor{})
+}
+
 const baseURL = "https://api.cohere.ai"
 
 func (a *Adaptor) DefaultBaseURL() string {
 	return baseURL
 }
 
-func (a *Adaptor) SupportMode(m mode.Mode) bool {
+func (a *Adaptor) SupportMode(mt *meta.Meta) bool {
+	m := adaptor.ModeFromMeta(mt)
+
 	return m == mode.ChatCompletions
 }
 
@@ -91,7 +98,7 @@ func (a *Adaptor) DoRequest(
 	_ *gin.Context,
 	req *http.Request,
 ) (*http.Response, error) {
-	return utils.DoRequest(req, meta.RequestTimeout)
+	return utils.DoRequestWithMeta(req, meta)
 }
 
 func (a *Adaptor) DoResponse(
@@ -99,18 +106,16 @@ func (a *Adaptor) DoResponse(
 	_ adaptor.Store,
 	c *gin.Context,
 	resp *http.Response,
-) (usage model.Usage, err adaptor.Error) {
+) (adaptor.DoResponseResult, adaptor.Error) {
 	if utils.IsStreamResponse(resp) {
-		usage, err = StreamHandler(meta, c, resp)
-	} else {
-		usage, err = Handler(meta, c, resp)
+		return StreamHandler(meta, c, resp)
 	}
-
-	return usage, err
+	return Handler(meta, c, resp)
 }
 
 func (a *Adaptor) Metadata() adaptor.Metadata {
 	return adaptor.Metadata{
+		Readme: "Cohere Chat API\nUses `/v1/chat`\nOnly chat completions mode is supported",
 		Models: ModelList,
 	}
 }

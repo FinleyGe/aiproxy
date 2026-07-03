@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/bytedance/sonic"
 	"github.com/labring/aiproxy/core/common"
@@ -23,53 +24,69 @@ type RequestDetail struct {
 	LogID                 int       `gorm:"index"                json:"log_id"`
 }
 
-func (d *RequestDetail) BeforeSave(_ *gorm.DB) (err error) {
-	if reqMax := config.GetLogDetailRequestBodyMaxSize(); reqMax > 0 &&
-		int64(len(d.RequestBody)) > reqMax {
-		d.RequestBody = common.TruncateByRune(d.RequestBody, int(reqMax)) + "..."
-		d.RequestBodyTruncated = true
-	} else if reqMax < 0 {
+func truncateDetailBody(body string, maxSize int64) (string, bool) {
+	switch {
+	case maxSize < 0:
+		return "", true
+	case maxSize == 0:
+		return body, false
+	case int64(len(body)) <= maxSize:
+		return body, false
+	default:
+		if maxSize <= 3 {
+			return common.TruncateByRune(body, int(maxSize)), true
+		}
+
+		return common.TruncateByRune(body, int(maxSize)-3) + "...", true
+	}
+}
+
+func (d *RequestDetail) ApplyBodySizeLimits(requestMaxSize, responseMaxSize int64) {
+	d.RequestBody, d.RequestBodyTruncated = truncateDetailBody(d.RequestBody, requestMaxSize)
+	d.ResponseBody, d.ResponseBodyTruncated = truncateDetailBody(d.ResponseBody, responseMaxSize)
+}
+
+func (d *RequestDetail) DropInvalidUTF8Bodies() {
+	if d.RequestBody != "" && !utf8.ValidString(d.RequestBody) {
 		d.RequestBody = ""
-		d.RequestBodyTruncated = true
+		d.RequestBodyTruncated = false
 	}
 
-	if respMax := config.GetLogDetailResponseBodyMaxSize(); respMax > 0 &&
-		int64(len(d.ResponseBody)) > respMax {
-		d.ResponseBody = common.TruncateByRune(d.ResponseBody, int(respMax)) + "..."
-		d.ResponseBodyTruncated = true
-	} else if respMax < 0 {
+	if d.ResponseBody != "" && !utf8.ValidString(d.ResponseBody) {
 		d.ResponseBody = ""
-		d.ResponseBodyTruncated = true
+		d.ResponseBodyTruncated = false
 	}
-
-	return err
 }
 
 type Log struct {
-	RequestDetail    *RequestDetail  `gorm:"foreignKey:LogID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE;" json:"request_detail,omitempty"`
-	RequestAt        time.Time       `                                                                      json:"request_at"`
-	RetryAt          time.Time       `                                                                      json:"retry_at,omitempty"`
-	TTFBMilliseconds ZeroNullInt64   `                                                                      json:"ttfb_milliseconds,omitempty"`
-	CreatedAt        time.Time       `gorm:"autoCreateTime;index"                                           json:"created_at"`
-	TokenName        string          `gorm:"size:32"                                                        json:"token_name,omitempty"`
-	Endpoint         EmptyNullString `gorm:"size:64"                                                        json:"endpoint,omitempty"`
-	Content          EmptyNullString `gorm:"type:text"                                                      json:"content,omitempty"`
-	GroupID          string          `gorm:"size:64"                                                        json:"group,omitempty"`
-	Model            string          `gorm:"size:64"                                                        json:"model"`
-	RequestID        EmptyNullString `gorm:"type:char(16);index:,where:request_id is not null"              json:"request_id"`
-	ID               int             `gorm:"primaryKey"                                                     json:"id"`
-	TokenID          int             `gorm:"index"                                                          json:"token_id,omitempty"`
-	ChannelID        int             `                                                                      json:"channel,omitempty"`
-	Code             int             `gorm:"index"                                                          json:"code,omitempty"`
-	Mode             int             `                                                                      json:"mode,omitempty"`
-	IP               EmptyNullString `gorm:"size:45;index:,where:ip is not null"                            json:"ip,omitempty"`
-	RetryTimes       ZeroNullInt64   `                                                                      json:"retry_times,omitempty"`
-	Price            Price           `gorm:"embedded"                                                       json:"price,omitempty"`
-	Usage            Usage           `gorm:"embedded"                                                       json:"usage,omitempty"`
-	UsedAmount       float64         `                                                                      json:"used_amount,omitempty"`
+	RequestDetail    *RequestDetail   `gorm:"foreignKey:LogID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE;" json:"request_detail,omitempty"`
+	RequestAt        time.Time        `                                                                      json:"request_at"`
+	RetryAt          time.Time        `                                                                      json:"retry_at,omitempty"`
+	TTFBMilliseconds ZeroNullInt64    `                                                                      json:"ttfb_milliseconds,omitempty"`
+	CreatedAt        time.Time        `gorm:"autoCreateTime;index"                                           json:"created_at"`
+	TokenName        string           `gorm:"size:32"                                                        json:"token_name,omitempty"`
+	Endpoint         EmptyNullString  `gorm:"size:64"                                                        json:"endpoint,omitempty"`
+	Content          EmptyNullString  `gorm:"type:text"                                                      json:"content,omitempty"`
+	GroupID          string           `gorm:"size:64"                                                        json:"group,omitempty"`
+	Model            string           `gorm:"size:128"                                                       json:"model"`
+	RequestID        EmptyNullString  `gorm:"type:char(16);index:,where:request_id is not null"              json:"request_id"`
+	UpstreamID       EmptyNullString  `gorm:"type:varchar(256)"                                              json:"upstream_id,omitempty"`
+	AsyncUsageStatus AsyncUsageStatus `                                                                      json:"async_usage_status,omitempty"`
+	ID               int              `gorm:"primaryKey"                                                     json:"id"`
+	TokenID          int              `gorm:"index"                                                          json:"token_id,omitempty"`
+	ChannelID        int              `                                                                      json:"channel,omitempty"`
+	Code             int              `gorm:"index"                                                          json:"code,omitempty"`
+	Mode             int              `                                                                      json:"mode,omitempty"`
+	IP               EmptyNullString  `gorm:"size:45;index:,where:ip is not null"                            json:"ip,omitempty"`
+	RetryTimes       ZeroNullInt64    `                                                                      json:"retry_times,omitempty"`
+	Price            Price            `gorm:"embedded"                                                       json:"price,omitempty"`
+	Usage            Usage            `gorm:"embedded"                                                       json:"usage,omitempty"`
+	UsageContext     UsageContext     `gorm:"embedded"                                                       json:"usage_context,omitempty"`
+	Amount           Amount           `gorm:"embedded"                                                       json:"amount,omitempty"`
+	PromptCacheKey   EmptyNullString  `gorm:"type:text"                                                      json:"prompt_cache_key,omitempty"`
 	// https://platform.openai.com/docs/guides/safety-best-practices#end-user-ids
-	User     EmptyNullString   `gorm:"type:text"                                                      json:"user,omitempty"`
-	Metadata map[string]string `gorm:"serializer:fastjson;type:text"                                  json:"metadata,omitempty"`
+	User     EmptyNullString   `gorm:"type:text"                     json:"user,omitempty"`
+	Metadata map[string]string `gorm:"serializer:fastjson;type:text" json:"metadata,omitempty"`
 }
 
 func CreateLogIndexes(db *gorm.DB) error {
@@ -147,13 +164,15 @@ func (l *Log) MarshalJSON() ([]byte, error) {
 
 	a := &struct {
 		*Alias
-		CreatedAt int64 `json:"created_at"`
-		RequestAt int64 `json:"request_at"`
-		RetryAt   int64 `json:"retry_at,omitempty"`
+		CreatedAt  int64   `json:"created_at"`
+		RequestAt  int64   `json:"request_at"`
+		RetryAt    int64   `json:"retry_at,omitempty"`
+		UsedAmount float64 `json:"used_amount,omitempty"`
 	}{
-		Alias:     (*Alias)(l),
-		CreatedAt: l.CreatedAt.UnixMilli(),
-		RequestAt: l.RequestAt.UnixMilli(),
+		Alias:      (*Alias)(l),
+		CreatedAt:  l.CreatedAt.UnixMilli(),
+		RequestAt:  l.RequestAt.UnixMilli(),
+		UsedAmount: l.Amount.UsedAmount,
 	}
 	if !l.RetryAt.IsZero() {
 		a.RetryAt = l.RetryAt.UnixMilli()
@@ -205,6 +224,11 @@ func CleanLog(batchSize int, optimize bool) (err error) {
 	}
 
 	err = cleanLogDetail(batchSize)
+	if err != nil {
+		return err
+	}
+
+	err = cleanAsyncUsageInfo(batchSize)
 	if err != nil {
 		return err
 	}
@@ -272,6 +296,15 @@ func cleanLog(batchSize int) error {
 		Error
 }
 
+func cleanAsyncUsageInfo(batchSize int) error {
+	logStorageHours := config.GetLogStorageHours()
+	if logStorageHours == 0 {
+		return nil
+	}
+
+	return CleanupFinishedAsyncUsages(time.Duration(logStorageHours)*time.Hour, batchSize)
+}
+
 func optimizeLog() error {
 	switch {
 	case common.UsingSQLite:
@@ -334,10 +367,14 @@ func RecordConsumeLog(
 	retryTimes int,
 	requestDetail *RequestDetail,
 	usage Usage,
+	usageContext UsageContext,
 	modelPrice Price,
-	amount float64,
+	amountDetail Amount,
 	user string,
 	metadata map[string]string,
+	promptCacheKey string,
+	upstreamID string,
+	asyncUsageStatus AsyncUsageStatus,
 ) error {
 	if createAt.IsZero() {
 		createAt = time.Now()
@@ -349,6 +386,12 @@ func RecordConsumeLog(
 
 	if firstByteAt.IsZero() || firstByteAt.Before(requestAt) {
 		firstByteAt = requestAt
+	}
+
+	// Truncate upstreamID to max length
+	const maxUpstreamIDLength = 256
+	if len(upstreamID) > maxUpstreamIDLength {
+		upstreamID = upstreamID[:maxUpstreamIDLength]
 	}
 
 	log := &Log{
@@ -371,9 +414,13 @@ func RecordConsumeLog(
 		RequestDetail:    requestDetail,
 		Price:            modelPrice,
 		Usage:            usage,
-		UsedAmount:       amount,
+		UsageContext:     usageContext,
+		Amount:           amountDetail,
 		User:             EmptyNullString(user),
 		Metadata:         metadata,
+		PromptCacheKey:   EmptyNullString(promptCacheKey),
+		UpstreamID:       EmptyNullString(upstreamID),
+		AsyncUsageStatus: asyncUsageStatus,
 	}
 
 	return LogDB.Create(log).Error
@@ -382,7 +429,7 @@ func RecordConsumeLog(
 func getLogOrder(order string) string {
 	prefix, suffix, _ := strings.Cut(order, "-")
 	switch prefix {
-	case "request_at", "id":
+	case "created_at", "request_at", "id":
 		switch suffix {
 		case "asc":
 			return prefix + " asc"
@@ -403,14 +450,14 @@ const (
 )
 
 type GetLogsResult struct {
-	Logs     []*Log `json:"logs"`
-	Total    int64  `json:"total"`
-	Channels []int  `json:"channels,omitempty"`
+	Logs     []*Log   `json:"logs"`
+	Total    int64    `json:"total"`
+	Channels []int    `json:"channels,omitempty"`
+	Models   []string `json:"models,omitempty"`
 }
 
 type GetGroupLogsResult struct {
 	GetLogsResult
-	Models     []string `json:"models"`
 	TokenNames []string `json:"token_names"`
 }
 
@@ -420,6 +467,7 @@ func buildGetLogsQuery(
 	endTimestamp time.Time,
 	modelName string,
 	requestID string,
+	upstreamID string,
 	tokenID int,
 	tokenName string,
 	channelID int,
@@ -432,6 +480,10 @@ func buildGetLogsQuery(
 
 	if requestID != "" {
 		tx = tx.Where("request_id = ?", requestID)
+	}
+
+	if upstreamID != "" {
+		tx = tx.Where("upstream_id = ?", upstreamID)
 	}
 
 	if ip != "" {
@@ -491,6 +543,7 @@ func getLogs(
 	endTimestamp time.Time,
 	modelName string,
 	requestID string,
+	upstreamID string,
 	tokenID int,
 	tokenName string,
 	channelID int,
@@ -517,6 +570,7 @@ func getLogs(
 			endTimestamp,
 			modelName,
 			requestID,
+			upstreamID,
 			tokenID,
 			tokenName,
 			channelID,
@@ -534,6 +588,7 @@ func getLogs(
 			endTimestamp,
 			modelName,
 			requestID,
+			upstreamID,
 			tokenID,
 			tokenName,
 			channelID,
@@ -571,6 +626,7 @@ func GetLogs(
 	endTimestamp time.Time,
 	modelName string,
 	requestID string,
+	upstreamID string,
 	channelID int,
 	order string,
 	codeType CodeType,
@@ -605,6 +661,7 @@ func GetLogs(
 			endTimestamp,
 			modelName,
 			requestID,
+			upstreamID,
 			0,
 			"",
 			channelID,
@@ -640,6 +697,7 @@ func GetGroupLogs(
 	endTimestamp time.Time,
 	modelName string,
 	requestID string,
+	upstreamID string,
 	tokenID int,
 	tokenName string,
 	order string,
@@ -673,6 +731,7 @@ func GetGroupLogs(
 			endTimestamp,
 			modelName,
 			requestID,
+			upstreamID,
 			tokenID,
 			tokenName,
 			0,
@@ -709,18 +768,275 @@ func GetGroupLogs(
 
 	return &GetGroupLogsResult{
 		GetLogsResult: GetLogsResult{
-			Logs:  logs,
-			Total: total,
+			Logs:   logs,
+			Total:  total,
+			Models: models,
 		},
-		Models:     models,
 		TokenNames: tokenNames,
 	}, nil
+}
+
+func exportLogs(
+	group string,
+	startTimestamp time.Time,
+	endTimestamp time.Time,
+	modelName string,
+	requestID string,
+	upstreamID string,
+	tokenID int,
+	tokenName string,
+	channelID int,
+	order string,
+	codeType CodeType,
+	code int,
+	withBody bool,
+	ip string,
+	user string,
+	maxEntries int,
+) ([]*Log, error) {
+	var logs []*Log
+
+	query := buildGetLogsQuery(
+		group,
+		startTimestamp,
+		endTimestamp,
+		modelName,
+		requestID,
+		upstreamID,
+		tokenID,
+		tokenName,
+		channelID,
+		codeType,
+		code,
+		ip,
+		user,
+	)
+
+	if withBody {
+		query = query.Preload("RequestDetail")
+	}
+
+	query = query.Order(getLogOrder(order))
+	if maxEntries > 0 {
+		query = query.Limit(maxEntries)
+	}
+
+	return logs, query.Find(&logs).Error
+}
+
+func exportLogsRange(
+	group string,
+	startTimestamp time.Time,
+	endExclusive time.Time,
+	modelName string,
+	requestID string,
+	upstreamID string,
+	tokenID int,
+	tokenName string,
+	channelID int,
+	order string,
+	codeType CodeType,
+	code int,
+	withBody bool,
+	ip string,
+	user string,
+	maxEntries int,
+) ([]*Log, error) {
+	var logs []*Log
+
+	query := buildGetLogsQuery(
+		group,
+		time.Time{},
+		time.Time{},
+		modelName,
+		requestID,
+		upstreamID,
+		tokenID,
+		tokenName,
+		channelID,
+		codeType,
+		code,
+		ip,
+		user,
+	)
+
+	if !startTimestamp.IsZero() {
+		query = query.Where("created_at >= ?", startTimestamp)
+	}
+
+	if !endExclusive.IsZero() {
+		query = query.Where("created_at < ?", endExclusive)
+	}
+
+	if withBody {
+		query = query.Preload("RequestDetail")
+	}
+
+	query = query.Order(getLogOrder(order))
+	if maxEntries > 0 {
+		query = query.Limit(maxEntries)
+	}
+
+	return logs, query.Find(&logs).Error
+}
+
+func ExportLogs(
+	startTimestamp time.Time,
+	endTimestamp time.Time,
+	modelName string,
+	requestID string,
+	upstreamID string,
+	channelID int,
+	order string,
+	codeType CodeType,
+	code int,
+	withBody bool,
+	ip string,
+	user string,
+	maxEntries int,
+) ([]*Log, error) {
+	return exportLogs(
+		"",
+		startTimestamp,
+		endTimestamp,
+		modelName,
+		requestID,
+		upstreamID,
+		0,
+		"",
+		channelID,
+		order,
+		codeType,
+		code,
+		withBody,
+		ip,
+		user,
+		maxEntries,
+	)
+}
+
+func ExportGroupLogs(
+	group string,
+	startTimestamp time.Time,
+	endTimestamp time.Time,
+	modelName string,
+	requestID string,
+	upstreamID string,
+	tokenID int,
+	tokenName string,
+	order string,
+	codeType CodeType,
+	code int,
+	withBody bool,
+	ip string,
+	user string,
+	maxEntries int,
+) ([]*Log, error) {
+	if group == "" {
+		return nil, errors.New("group is required")
+	}
+
+	return exportLogs(
+		group,
+		startTimestamp,
+		endTimestamp,
+		modelName,
+		requestID,
+		upstreamID,
+		tokenID,
+		tokenName,
+		0,
+		order,
+		codeType,
+		code,
+		withBody,
+		ip,
+		user,
+		maxEntries,
+	)
+}
+
+func ExportLogsRange(
+	startTimestamp time.Time,
+	endExclusive time.Time,
+	modelName string,
+	requestID string,
+	upstreamID string,
+	channelID int,
+	order string,
+	codeType CodeType,
+	code int,
+	withBody bool,
+	ip string,
+	user string,
+	maxEntries int,
+) ([]*Log, error) {
+	return exportLogsRange(
+		"",
+		startTimestamp,
+		endExclusive,
+		modelName,
+		requestID,
+		upstreamID,
+		0,
+		"",
+		channelID,
+		order,
+		codeType,
+		code,
+		withBody,
+		ip,
+		user,
+		maxEntries,
+	)
+}
+
+func ExportGroupLogsRange(
+	group string,
+	startTimestamp time.Time,
+	endExclusive time.Time,
+	modelName string,
+	requestID string,
+	upstreamID string,
+	tokenID int,
+	tokenName string,
+	order string,
+	codeType CodeType,
+	code int,
+	withBody bool,
+	ip string,
+	user string,
+	maxEntries int,
+) ([]*Log, error) {
+	if group == "" {
+		return nil, errors.New("group is required")
+	}
+
+	return exportLogsRange(
+		group,
+		startTimestamp,
+		endExclusive,
+		modelName,
+		requestID,
+		upstreamID,
+		tokenID,
+		tokenName,
+		0,
+		order,
+		codeType,
+		code,
+		withBody,
+		ip,
+		user,
+		maxEntries,
+	)
 }
 
 func buildSearchLogsQuery(
 	group string,
 	keyword string,
 	requestID string,
+	upstreamID string,
 	tokenID int,
 	tokenName string,
 	modelName string,
@@ -736,6 +1052,10 @@ func buildSearchLogsQuery(
 
 	if requestID != "" {
 		tx = tx.Where("request_id = ?", requestID)
+	}
+
+	if upstreamID != "" {
+		tx = tx.Where("upstream_id = ?", upstreamID)
 	}
 
 	if ip != "" {
@@ -798,6 +1118,11 @@ func buildSearchLogsQuery(
 			values = append(values, keyword)
 		}
 
+		if upstreamID == "" {
+			conditions = append(conditions, "upstream_id = ?")
+			values = append(values, keyword)
+		}
+
 		if group == "" {
 			conditions = append(conditions, "group_id = ?")
 			values = append(values, keyword)
@@ -845,6 +1170,7 @@ func searchLogs(
 	group string,
 	keyword string,
 	requestID string,
+	upstreamID string,
 	tokenID int,
 	tokenName string,
 	modelName string,
@@ -872,6 +1198,7 @@ func searchLogs(
 			group,
 			keyword,
 			requestID,
+			upstreamID,
 			tokenID,
 			tokenName,
 			modelName,
@@ -890,6 +1217,7 @@ func searchLogs(
 			group,
 			keyword,
 			requestID,
+			upstreamID,
 			tokenID,
 			tokenName,
 			modelName,
@@ -929,6 +1257,7 @@ func searchLogs(
 func SearchLogs(
 	keyword string,
 	requestID string,
+	upstreamID string,
 	group string,
 	tokenID int,
 	tokenName string,
@@ -949,6 +1278,7 @@ func SearchLogs(
 		total    int64
 		logs     []*Log
 		channels []int
+		models   []string
 	)
 
 	g := new(errgroup.Group)
@@ -960,6 +1290,7 @@ func SearchLogs(
 			group,
 			keyword,
 			requestID,
+			upstreamID,
 			tokenID,
 			tokenName,
 			modelName,
@@ -986,6 +1317,13 @@ func SearchLogs(
 		return err
 	})
 
+	g.Go(func() error {
+		var err error
+
+		models, err = GetUsedModels(channelID, startTimestamp, endTimestamp)
+		return err
+	})
+
 	if err := g.Wait(); err != nil {
 		return nil, err
 	}
@@ -994,6 +1332,7 @@ func SearchLogs(
 		Logs:     logs,
 		Total:    total,
 		Channels: channels,
+		Models:   models,
 	}
 
 	return result, nil
@@ -1003,6 +1342,7 @@ func SearchGroupLogs(
 	group string,
 	keyword string,
 	requestID string,
+	upstreamID string,
 	tokenID int,
 	tokenName string,
 	modelName string,
@@ -1036,6 +1376,7 @@ func SearchGroupLogs(
 		total, logs, err = searchLogs(group,
 			keyword,
 			requestID,
+			upstreamID,
 			tokenID,
 			tokenName,
 			modelName,
@@ -1075,10 +1416,10 @@ func SearchGroupLogs(
 
 	result := &GetGroupLogsResult{
 		GetLogsResult: GetLogsResult{
-			Logs:  logs,
-			Total: total,
+			Logs:   logs,
+			Total:  total,
+			Models: models,
 		},
-		Models:     models,
 		TokenNames: tokenNames,
 	}
 

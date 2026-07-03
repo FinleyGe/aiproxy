@@ -2,7 +2,6 @@ package textembeddingsinference
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -23,7 +22,10 @@ func ConvertRerankRequest(
 ) (adaptor.ConvertResult, error) {
 	node, err := common.UnmarshalRequest2NodeReusable(req)
 	if err != nil {
-		return adaptor.ConvertResult{}, fmt.Errorf("failed to parse request body: %w", err)
+		return adaptor.ConvertResult{}, convertRequestError(
+			meta,
+			fmt.Sprintf("failed to parse request body: %s", err),
+		)
 	}
 
 	// Set the actual model in the request
@@ -35,7 +37,7 @@ func ConvertRerankRequest(
 	// Get the documents array and rename it to texts
 	documentsNode := node.Get("documents")
 	if !documentsNode.Exists() {
-		return adaptor.ConvertResult{}, errors.New("documents field not found")
+		return adaptor.ConvertResult{}, convertRequestError(meta, "documents field not found")
 	}
 
 	// Set the texts field with the documents value
@@ -57,9 +59,9 @@ func ConvertRerankRequest(
 	if returnDocumentsNode.Exists() {
 		returnDocuments, err := returnDocumentsNode.Bool()
 		if err != nil {
-			return adaptor.ConvertResult{}, fmt.Errorf(
-				"failed to unmarshal return_documents field: %w",
-				err,
+			return adaptor.ConvertResult{}, convertRequestError(
+				meta,
+				fmt.Sprintf("failed to unmarshal return_documents field: %s", err),
 			)
 		}
 
@@ -95,6 +97,23 @@ func ConvertRerankRequest(
 	}, nil
 }
 
+func convertRequestError(meta *meta.Meta, message string) adaptor.Error {
+	if meta == nil {
+		return relaymodel.WrapperOpenAIErrorWithMessage(
+			message,
+			"invalid_request_error",
+			http.StatusBadRequest,
+		)
+	}
+
+	return relaymodel.WrapperErrorWithMessage(
+		meta.Mode,
+		http.StatusBadRequest,
+		message,
+		relaymodel.WithCode("invalid_request_error"),
+	)
+}
+
 type RerankResponse []RerankResponseItem
 
 type RerankResponseItem struct {
@@ -122,9 +141,9 @@ func RerankHandler(
 	meta *meta.Meta,
 	c *gin.Context,
 	resp *http.Response,
-) (model.Usage, adaptor.Error) {
+) (adaptor.DoResponseResult, adaptor.Error) {
 	if resp.StatusCode != http.StatusOK {
-		return model.Usage{}, RerankErrorHanlder(resp)
+		return adaptor.DoResponseResult{}, RerankErrorHanlder(resp)
 	}
 
 	defer resp.Body.Close()
@@ -135,7 +154,7 @@ func RerankHandler(
 
 	err := sonic.ConfigDefault.NewDecoder(resp.Body).Decode(&respSlice)
 	if err != nil {
-		return model.Usage{}, relaymodel.WrapperOpenAIError(
+		return adaptor.DoResponseResult{}, relaymodel.WrapperOpenAIError(
 			err,
 			"read_response_body_failed",
 			http.StatusInternalServerError,
@@ -164,7 +183,7 @@ func RerankHandler(
 
 	jsonResponse, err := sonic.Marshal(rerankResp)
 	if err != nil {
-		return usage, relaymodel.WrapperOpenAIError(
+		return adaptor.DoResponseResult{Usage: usage}, relaymodel.WrapperOpenAIError(
 			err,
 			"marshal_response_body_failed",
 			http.StatusInternalServerError,
@@ -179,5 +198,5 @@ func RerankHandler(
 		log.Warnf("write response body failed: %v", err)
 	}
 
-	return usage, nil
+	return adaptor.DoResponseResult{Usage: usage}, nil
 }

@@ -40,6 +40,7 @@ type Channel struct {
 	Key                     string            `gorm:"type:text;index:,length:191"        json:"key"                        yaml:"key,omitempty"`
 	Name                    string            `gorm:"size:64;index"                      json:"name"                       yaml:"name,omitempty"`
 	BaseURL                 string            `gorm:"size:128;index"                     json:"base_url"                   yaml:"base_url,omitempty"`
+	ProxyURL                string            `gorm:"size:255"                           json:"proxy_url"                  yaml:"proxy_url,omitempty"`
 	Models                  []string          `gorm:"serializer:fastjson;type:text"      json:"models"                     yaml:"models,omitempty"`
 	Balance                 float64           `                                          json:"balance"                    yaml:"balance,omitempty"`
 	ID                      int               `gorm:"primaryKey"                         json:"id"                         yaml:"id,omitempty"`
@@ -51,6 +52,10 @@ type Channel struct {
 	Priority                int32             `                                          json:"priority"                   yaml:"priority,omitempty"`
 	EnabledAutoBalanceCheck bool              `                                          json:"enabled_auto_balance_check" yaml:"enabled_auto_balance_check,omitempty"`
 	BalanceThreshold        float64           `                                          json:"balance_threshold"          yaml:"balance_threshold,omitempty"`
+	SkipTLSVerify           bool              `                                          json:"skip_tls_verify"            yaml:"skip_tls_verify,omitempty"`
+	EnabledNoPermissionBan  bool              `                                          json:"enabled_no_permission_ban"  yaml:"enabled_no_permission_ban,omitempty"`
+	WarnErrorRate           float64           `                                          json:"warn_error_rate"            yaml:"warn_error_rate,omitempty"`
+	MaxErrorRate            float64           `                                          json:"max_error_rate"             yaml:"max_error_rate,omitempty"`
 	Configs                 ChannelConfigs    `gorm:"serializer:fastjson;type:text"      json:"configs,omitempty"          yaml:"configs,omitempty"`
 	Sets                    []string          `gorm:"serializer:fastjson;type:text"      json:"sets,omitempty"             yaml:"sets,omitempty"`
 }
@@ -75,12 +80,18 @@ func (c *Channel) GetBalanceThreshold() float64 {
 
 const (
 	DefaultPriority = 10
+	MaxPriority     = 1000000
 )
 
 func (c *Channel) GetPriority() int32 {
 	if c.Priority == 0 {
 		return DefaultPriority
 	}
+
+	if c.Priority > MaxPriority {
+		return MaxPriority
+	}
+
 	return c.Priority
 }
 
@@ -402,10 +413,15 @@ func UpdateChannel(channel *Channel) (err error) {
 		"model_mapping",
 		"key",
 		"base_url",
+		"proxy_url",
 		"models",
 		"priority",
-		"config",
+		"configs",
 		"enabled_auto_balance_check",
+		"skip_tls_verify",
+		"enabled_no_permission_ban",
+		"warn_error_rate",
+		"max_error_rate",
 		"balance_threshold",
 		"sets",
 	}
@@ -453,7 +469,9 @@ func (c *Channel) UpdateModelTest(
 				return err
 			}
 		} else if !c.LastTestErrorAt.IsZero() && time.Since(c.LastTestErrorAt) > time.Hour {
-			result := tx.Model(&Channel{}).Where("id = ?", c.ID).Update("last_test_error_at", gorm.Expr("NULL"))
+			result := tx.Model(&Channel{}).
+				Where("id = ?", c.ID).
+				Update("last_test_error_at", gorm.Expr("NULL"))
 			if err := HandleUpdateResult(result, ErrChannelNotFound); err != nil {
 				return err
 			}
@@ -544,4 +562,27 @@ func UpdateChannelUsedAmount(id int, amount float64, requestCount, retryCount in
 		})
 
 	return HandleUpdateResult(result, ErrChannelNotFound)
+}
+
+type ChannelBasicInfo struct {
+	ID   int         `json:"id"`
+	Name string      `json:"name"`
+	Type ChannelType `json:"type"`
+}
+
+func GetChannelsBasicInfoByIDs(ids []int) ([]*ChannelBasicInfo, error) {
+	if len(ids) == 0 {
+		return []*ChannelBasicInfo{}, nil
+	}
+
+	var result []*ChannelBasicInfo
+
+	err := DB.Unscoped().
+		Model(&Channel{}).
+		Select("id", "name", "type").
+		Where("id IN ?", ids).
+		Find(&result).
+		Error
+
+	return result, err
 }

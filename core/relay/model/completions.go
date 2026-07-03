@@ -21,38 +21,55 @@ type Audio struct {
 	Format string `json:"format,omitempty"`
 }
 
+type OutputAudio struct {
+	ID         string `json:"id,omitempty"`
+	Data       string `json:"data,omitempty"`
+	Transcript string `json:"transcript,omitempty"`
+	ExpiresAt  int64  `json:"expires_at,omitempty"`
+}
+
 type StreamOptions struct {
 	IncludeUsage bool `json:"include_usage,omitempty"`
 }
 
 type GeneralOpenAIRequest struct {
-	Prompt              any             `json:"prompt,omitempty"`
-	Input               any             `json:"input,omitempty"`
-	Metadata            any             `json:"metadata,omitempty"`
-	Functions           any             `json:"functions,omitempty"`
-	LogitBias           any             `json:"logit_bias,omitempty"`
-	FunctionCall        any             `json:"function_call,omitempty"`
-	ToolChoice          any             `json:"tool_choice,omitempty"`
-	Stop                any             `json:"stop,omitempty"`
-	TopLogprobs         *int            `json:"top_logprobs,omitempty"`
-	PresencePenalty     *float64        `json:"presence_penalty,omitempty"`
-	ResponseFormat      *ResponseFormat `json:"response_format,omitempty"`
-	FrequencyPenalty    *float64        `json:"frequency_penalty,omitempty"`
-	Logprobs            *bool           `json:"logprobs,omitempty"`
-	StreamOptions       *StreamOptions  `json:"stream_options,omitempty"`
-	Temperature         *float64        `json:"temperature,omitempty"`
-	TopP                *float64        `json:"top_p,omitempty"`
-	Model               string          `json:"model,omitempty"`
-	User                string          `json:"user,omitempty"`
-	Size                string          `json:"size,omitempty"`
-	Messages            []Message       `json:"messages,omitempty"`
-	Tools               []Tool          `json:"tools,omitempty"`
-	Seed                float64         `json:"seed,omitempty"`
-	MaxTokens           int             `json:"max_tokens,omitempty"`
-	MaxCompletionTokens int             `json:"max_completion_tokens,omitempty"`
-	TopK                int             `json:"top_k,omitempty"`
-	NumCtx              int             `json:"num_ctx,omitempty"`
-	Stream              bool            `json:"stream,omitempty"`
+	Prompt               any             `json:"prompt,omitempty"`
+	Input                any             `json:"input,omitempty"`
+	Metadata             any             `json:"metadata,omitempty"`
+	Functions            any             `json:"functions,omitempty"`
+	LogitBias            any             `json:"logit_bias,omitempty"`
+	FunctionCall         any             `json:"function_call,omitempty"`
+	ToolChoice           any             `json:"tool_choice,omitempty"`
+	Stop                 any             `json:"stop,omitempty"`
+	TopLogprobs          *int            `json:"top_logprobs,omitempty"`
+	PresencePenalty      *float64        `json:"presence_penalty,omitempty"`
+	ResponseFormat       *ResponseFormat `json:"response_format,omitempty"`
+	Audio                *Audio          `json:"audio,omitempty"`
+	FrequencyPenalty     *float64        `json:"frequency_penalty,omitempty"`
+	Logprobs             *bool           `json:"logprobs,omitempty"`
+	StreamOptions        *StreamOptions  `json:"stream_options,omitempty"`
+	Temperature          *float64        `json:"temperature,omitempty"`
+	TopP                 *float64        `json:"top_p,omitempty"`
+	ServiceTier          string          `json:"service_tier,omitempty"`
+	PromptCacheKey       string          `json:"prompt_cache_key,omitempty"`
+	PromptCacheRetention string          `json:"prompt_cache_retention,omitempty"`
+	Model                string          `json:"model,omitempty"`
+	User                 string          `json:"user,omitempty"`
+	Size                 string          `json:"size,omitempty"`
+	Messages             []Message       `json:"messages,omitempty"`
+	Tools                []Tool          `json:"tools,omitempty"`
+	Modalities           []string        `json:"modalities,omitempty"`
+	Seed                 float64         `json:"seed,omitempty"`
+	N                    int             `json:"n,omitempty"`
+	MaxTokens            int             `json:"max_tokens,omitempty"`
+	MaxCompletionTokens  int             `json:"max_completion_tokens,omitempty"`
+	TopK                 int             `json:"top_k,omitempty"`
+	NumCtx               int             `json:"num_ctx,omitempty"`
+	Stream               bool            `json:"stream,omitempty"`
+	ParallelToolCalls    *bool           `json:"parallel_tool_calls,omitempty"`
+	ReasoningEffort      *string         `json:"reasoning_effort,omitempty"`
+	EnableThinking       *bool           `json:"enable_thinking,omitempty"`
+	ThinkingBudget       *int            `json:"thinking_budget,omitempty"`
 	// aiproxy control field
 	Thinking *GeneralThinking `json:"thinking,omitempty"`
 }
@@ -117,13 +134,14 @@ type TextResponse struct {
 }
 
 type Message struct {
-	Content          any        `json:"content,omitempty"`
-	ReasoningContent string     `json:"reasoning_content,omitempty"`
-	Signature        string     `json:"signature,omitempty"`
-	Name             *string    `json:"name,omitempty"`
-	Role             string     `json:"role,omitempty"`
-	ToolCallID       string     `json:"tool_call_id,omitempty"`
-	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
+	Content          any          `json:"content,omitempty"`
+	Audio            *OutputAudio `json:"audio,omitempty"`
+	ReasoningContent string       `json:"reasoning_content,omitempty"`
+	Signature        string       `json:"signature,omitempty"`
+	Name             *string      `json:"name,omitempty"`
+	Role             string       `json:"role,omitempty"`
+	ToolCallID       string       `json:"tool_call_id,omitempty"`
+	ToolCalls        []ToolCall   `json:"tool_calls,omitempty"`
 }
 
 func (m *Message) IsStringContent() bool {
@@ -212,6 +230,35 @@ func (m *Message) ParseContent() []MessageContent {
 						},
 					})
 				}
+			case ContentTypeInputAudio:
+				if subObj, ok := contentMap["input_audio"].(map[string]any); ok {
+					data, _ := subObj["data"].(string)
+					format, _ := subObj["format"].(string)
+					url, _ := subObj["url"].(string)
+
+					contentList = append(contentList, MessageContent{
+						Type: ContentTypeInputAudio,
+						InputAudio: &InputAudio{
+							Data:   data,
+							Format: format,
+							URL:    url,
+						},
+					})
+				}
+			case ContentTypeVideoURL:
+				if subObj, ok := contentMap["video_url"].(map[string]any); ok {
+					url, ok := subObj["url"].(string)
+					if !ok {
+						continue
+					}
+
+					contentList = append(contentList, MessageContent{
+						Type: ContentTypeVideoURL,
+						VideoURL: &VideoURL{
+							URL: url,
+						},
+					})
+				}
 			}
 		}
 
@@ -236,6 +283,24 @@ func (m *Message) ParseContent() []MessageContent {
 						URL: imageURL.URL,
 					},
 				})
+			case ContentTypeInputAudio:
+				if contentItem.InputAudio == nil {
+					continue
+				}
+
+				contentList = append(contentList, MessageContent{
+					Type:       ContentTypeInputAudio,
+					InputAudio: contentItem.InputAudio,
+				})
+			case ContentTypeVideoURL:
+				if contentItem.VideoURL == nil {
+					continue
+				}
+
+				contentList = append(contentList, MessageContent{
+					Type:     ContentTypeVideoURL,
+					VideoURL: contentItem.VideoURL,
+				})
 			}
 		}
 
@@ -250,8 +315,20 @@ type ImageURL struct {
 	Detail string `json:"detail,omitempty"`
 }
 
+type InputAudio struct {
+	Data   string `json:"data,omitempty"`
+	Format string `json:"format,omitempty"`
+	URL    string `json:"url,omitempty"`
+}
+
+type VideoURL struct {
+	URL string `json:"url,omitempty"`
+}
+
 type MessageContent struct {
-	ImageURL *ImageURL `json:"image_url,omitempty"`
-	Type     string    `json:"type,omitempty"`
-	Text     string    `json:"text,omitempty"`
+	ImageURL   *ImageURL   `json:"image_url,omitempty"`
+	InputAudio *InputAudio `json:"input_audio,omitempty"`
+	VideoURL   *VideoURL   `json:"video_url,omitempty"`
+	Type       string      `json:"type,omitempty"`
+	Text       string      `json:"text,omitempty"`
 }

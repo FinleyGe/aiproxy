@@ -12,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/labring/aiproxy/core/common"
 	"github.com/labring/aiproxy/core/model"
 	"github.com/labring/aiproxy/core/relay/adaptor"
 	"github.com/labring/aiproxy/core/relay/meta"
@@ -70,7 +71,7 @@ func ConvertSTTRequest(
 	meta *meta.Meta,
 	request *http.Request,
 ) (adaptor.ConvertResult, error) {
-	err := request.ParseMultipartForm(1024 * 1024 * 4)
+	err := common.ParseMultipartFormWithLimit(request)
 	if err != nil {
 		return adaptor.ConvertResult{}, err
 	}
@@ -165,7 +166,7 @@ func STTDoResponse(
 	meta *meta.Meta,
 	c *gin.Context,
 	_ *http.Response,
-) (usage model.Usage, err adaptor.Error) {
+) (adaptor.DoResponseResult, adaptor.Error) {
 	audioData, ok := meta.MustGet("audio_data").([]byte)
 	if !ok {
 		panic(fmt.Sprintf("audio data type error: %T, %v", audioData, audioData))
@@ -184,7 +185,7 @@ func STTDoResponse(
 
 	output := strings.Builder{}
 
-	usage = model.Usage{
+	usage := model.Usage{
 		InputTokens:      meta.RequestUsage.InputTokens,
 		AudioInputTokens: meta.RequestUsage.AudioInputTokens,
 		TotalTokens:      meta.RequestUsage.TotalTokens,
@@ -193,7 +194,7 @@ func STTDoResponse(
 	for {
 		messageType, data, err := conn.ReadMessage()
 		if err != nil {
-			return usage, relaymodel.WrapperOpenAIErrorWithMessage(
+			return adaptor.DoResponseResult{Usage: usage}, relaymodel.WrapperOpenAIErrorWithMessage(
 				"ali_wss_read_msg_failed",
 				nil,
 				http.StatusInternalServerError,
@@ -201,7 +202,7 @@ func STTDoResponse(
 		}
 
 		if messageType != websocket.TextMessage {
-			return usage, relaymodel.WrapperOpenAIErrorWithMessage(
+			return adaptor.DoResponseResult{Usage: usage}, relaymodel.WrapperOpenAIErrorWithMessage(
 				"expect text message, but got binary message",
 				nil,
 				http.StatusInternalServerError,
@@ -212,7 +213,7 @@ func STTDoResponse(
 
 		err = sonic.Unmarshal(data, &msg)
 		if err != nil {
-			return usage, relaymodel.WrapperOpenAIErrorWithMessage(
+			return adaptor.DoResponseResult{Usage: usage}, relaymodel.WrapperOpenAIErrorWithMessage(
 				"ali_wss_read_msg_failed",
 				nil,
 				http.StatusInternalServerError,
@@ -229,11 +230,13 @@ func STTDoResponse(
 
 				err = conn.WriteMessage(websocket.BinaryMessage, chunk)
 				if err != nil {
-					return usage, relaymodel.WrapperOpenAIErrorWithMessage(
-						"ali_wss_write_msg_failed",
-						nil,
-						http.StatusInternalServerError,
-					)
+					return adaptor.DoResponseResult{
+							Usage: usage,
+						}, relaymodel.WrapperOpenAIErrorWithMessage(
+							"ali_wss_write_msg_failed",
+							nil,
+							http.StatusInternalServerError,
+						)
 				}
 			}
 
@@ -250,20 +253,24 @@ func STTDoResponse(
 
 			finishData, err := sonic.Marshal(finishMsg)
 			if err != nil {
-				return usage, relaymodel.WrapperOpenAIErrorWithMessage(
-					"ali_wss_write_msg_failed",
-					nil,
-					http.StatusInternalServerError,
-				)
+				return adaptor.DoResponseResult{
+						Usage: usage,
+					}, relaymodel.WrapperOpenAIErrorWithMessage(
+						"ali_wss_write_msg_failed",
+						nil,
+						http.StatusInternalServerError,
+					)
 			}
 
 			err = conn.WriteMessage(websocket.TextMessage, finishData)
 			if err != nil {
-				return usage, relaymodel.WrapperOpenAIErrorWithMessage(
-					"ali_wss_write_msg_failed",
-					nil,
-					http.StatusInternalServerError,
-				)
+				return adaptor.DoResponseResult{
+						Usage: usage,
+					}, relaymodel.WrapperOpenAIErrorWithMessage(
+						"ali_wss_write_msg_failed",
+						nil,
+						http.StatusInternalServerError,
+					)
 			}
 		case "result-generated":
 			if msg.Payload.Output.STTSentence.EndTime != nil &&
@@ -290,11 +297,9 @@ func STTDoResponse(
 				"usage": sttUsage,
 			})
 
-			usage = sttUsage.ToModelUsage()
-
-			return usage, nil
+			return adaptor.DoResponseResult{Usage: sttUsage.ToModelUsage()}, nil
 		case "task-failed":
-			return usage, relaymodel.WrapperOpenAIErrorWithMessage(
+			return adaptor.DoResponseResult{Usage: usage}, relaymodel.WrapperOpenAIErrorWithMessage(
 				msg.Header.ErrorMessage,
 				msg.Header.ErrorCode,
 				http.StatusInternalServerError,

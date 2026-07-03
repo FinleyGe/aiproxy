@@ -122,6 +122,27 @@ var AwsModelIDMap = map[string]awsModelItem{
 		},
 		ID: "anthropic.claude-opus-4-5-20251101-v1:0",
 	},
+	"claude-opus-4-6": {
+		ModelConfig: model.ModelConfig{
+			Type:  mode.ChatCompletions,
+			Owner: model.ModelOwnerAnthropic,
+		},
+		ID: "anthropic.claude-opus-4-6-v1",
+	},
+	"claude-sonnet-4-6": {
+		ModelConfig: model.ModelConfig{
+			Type:  mode.ChatCompletions,
+			Owner: model.ModelOwnerAnthropic,
+		},
+		ID: "anthropic.claude-sonnet-4-6",
+	},
+	"claude-opus-4-7": {
+		ModelConfig: model.ModelConfig{
+			Type:  mode.ChatCompletions,
+			Owner: model.ModelOwnerAnthropic,
+		},
+		ID: "anthropic.claude-opus-4-7",
+	},
 }
 
 // https://docs.aws.amazon.com/bedrock/latest/userguide/inference-profiles-support.html
@@ -182,6 +203,21 @@ var awsModelCanCrossRegionMap = map[string]map[string]bool{
 		"ap": true,
 		"eu": true,
 	},
+	"anthropic.claude-opus-4-6-v1": {
+		"us": true,
+		"ap": true,
+		"eu": true,
+	},
+	"anthropic.claude-sonnet-4-6": {
+		"us": true,
+		"ap": true,
+		"eu": true,
+	},
+	"anthropic.claude-opus-4-7": {
+		"us": true,
+		"ap": true,
+		"eu": true,
+	},
 }
 
 var awsRegionCrossModelPrefixMap = map[string]string{
@@ -202,8 +238,16 @@ func awsRegionPrefix(awsRegionID string) string {
 }
 
 func awsModelCanCrossRegion(awsModelID, awsRegionPrefix string) bool {
+	if strings.HasPrefix(awsModelID, "arn:aws:bedrock:") {
+		return false
+	}
+
 	regionSet, exists := awsModelCanCrossRegionMap[awsModelID]
-	return exists && regionSet[awsRegionPrefix]
+	if !exists {
+		return true
+	}
+
+	return regionSet[awsRegionPrefix]
 }
 
 func awsModelCrossRegion(awsModelID, awsRegionPrefix string) string {
@@ -216,9 +260,15 @@ func awsModelCrossRegion(awsModelID, awsRegionPrefix string) string {
 }
 
 func awsModelID(requestModel, region string) string {
+	if strings.HasPrefix(requestModel, "arn:aws:bedrock:") {
+		return requestModel
+	}
+
 	item, ok := AwsModelIDMap[requestModel]
 	if ok {
 		requestModel = item.ID
+	} else if strings.HasPrefix(requestModel, "claude-") {
+		requestModel = "anthropic." + requestModel
 	}
 
 	regionPrefix := awsRegionPrefix(region)
